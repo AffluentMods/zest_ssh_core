@@ -1,7 +1,7 @@
-import 'package:dartssh2/src/algorithm/ssh_cipher_type.dart';
-import 'package:dartssh2/src/algorithm/ssh_hostkey_type.dart';
-import 'package:dartssh2/src/algorithm/ssh_kex_type.dart';
-import 'package:dartssh2/src/algorithm/ssh_mac_type.dart';
+import 'package:zest_ssh_core/src/algorithm/ssh_cipher_type.dart';
+import 'package:zest_ssh_core/src/algorithm/ssh_hostkey_type.dart';
+import 'package:zest_ssh_core/src/algorithm/ssh_kex_type.dart';
+import 'package:zest_ssh_core/src/algorithm/ssh_mac_type.dart';
 
 abstract class SSHAlgorithm {
   /// The name of the algorithm.
@@ -51,34 +51,49 @@ class SSHAlgorithms {
       SSHKexType.nistp256,
       SSHKexType.dhGexSha256,
       SSHKexType.dh14Sha256,
-      SSHKexType.dh14Sha1,
-      SSHKexType.dhGexSha1,
-      SSHKexType.dh1Sha1,
+      // SHA-1 key exchanges (dh14Sha1, dhGexSha1) removed from defaults -
+      // SHA-1 is collision-broken, so the strong defaults must not be
+      // negotiable down to it. Opt-in only via the compatibility profile
+      // (custom SSHAlgorithms). dh1Sha1 (1024-bit DH Group 1) likewise
+      // excluded.
     ],
     this.hostkey = const [
       SSHHostkeyType.ed25519,
       SSHHostkeyType.rsaSha512,
       SSHHostkeyType.rsaSha256,
-      SSHHostkeyType.rsaSha1,
+      // rsaSha1 (ssh-rsa, SHA-1 signatures) removed from defaults - a
+      // downgrade to SHA-1 host-key signatures must be opt-in only via the
+      // compatibility profile, not offered to every server by default.
       SSHHostkeyType.ecdsa521,
       SSHHostkeyType.ecdsa384,
       SSHHostkeyType.ecdsa256,
+      // Ed448 not offered by default until sign_dart is vetted
+      // SSHHostkeyType.ed448,
     ],
     this.cipher = const [
-      SSHCipherType.aes128ctr,
-      SSHCipherType.aes128cbc,
+      SSHCipherType.chacha20poly1305,
+      // Prefer the 256-bit key over the 128-bit one when a server offers
+      // both - a security-forward client should negotiate the stronger
+      // cipher first.
       SSHCipherType.aes256ctr,
-      SSHCipherType.aes256cbc,
+      SSHCipherType.aes128ctr,
+      // CBC mode ciphers removed from defaults - CVE-2008-5161 plaintext
+      // recovery when not paired with ETM MACs. Opt-in via custom
+      // SSHAlgorithms if required for legacy servers.
     ],
     this.mac = const [
-      SSHMacType.hmacSha256_96,
-      SSHMacType.hmacSha512_96,
-      SSHMacType.hmacSha256Etm,
+      // ETM (Encrypt-Then-MAC) variants are strongest -- prefer them.
       SSHMacType.hmacSha512Etm,
-      SSHMacType.hmacSha1,
-      SSHMacType.hmacSha256,
+      SSHMacType.hmacSha256Etm,
+      // Full-length HMAC variants next.
       SSHMacType.hmacSha512,
-      SSHMacType.hmacMd5,
+      SSHMacType.hmacSha256,
+      SSHMacType.hmacSha1,
+      // Truncated 96-bit MACs are weaker -- list last.
+      SSHMacType.hmacSha512_96,
+      SSHMacType.hmacSha256_96,
+      // hmac-md5 removed from defaults - MD5 is deprecated.
+      // Opt-in via custom SSHAlgorithms if required for legacy servers.
     ],
   });
 }

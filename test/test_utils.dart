@@ -1,8 +1,8 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:dartssh2/dartssh2.dart';
-import 'package:dartssh2/src/message/msg_channel.dart';
+import 'package:zest_ssh_core/dartssh2.dart';
+import 'package:zest_ssh_core/src/message/msg_channel.dart';
 
 /// A honeypot that accepts all passwords and public-keys
 Future<SSHClient> getHoneypotClient({

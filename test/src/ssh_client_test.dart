@@ -1,4 +1,9 @@
-import 'package:dartssh2/dartssh2.dart';
+@Tags(['integration'])
+library ssh_client_test;
+
+import 'dart:convert';
+
+import 'package:zest_ssh_core/dartssh2.dart';
 import 'package:test/test.dart';
 
 import '../test_utils.dart';
@@ -137,6 +142,7 @@ void main() {
         fail('should have thrown');
       } catch (e) {
         expect(e, isA<SSHAuthAbortError>());
+        expect((e as SSHAuthAbortError).reason!, isA<SSHSocketError>());
       }
 
       client.close();
@@ -154,6 +160,57 @@ void main() {
     test('works', () async {
       final client = await getTestClient();
       await client.ping();
+    });
+  });
+
+  group('SSHClient.forwardDynamic', () {
+    test('starts and closes local dynamic forward', () async {
+      final client = await getTestClient();
+
+      final dynamicForward = await client.forwardDynamic(
+        bindHost: '127.0.0.1',
+        bindPort: 0,
+      );
+
+      expect(dynamicForward.port, greaterThan(0));
+      expect(dynamicForward.isClosed, isFalse);
+
+      await dynamicForward.close();
+      expect(dynamicForward.isClosed, isTrue);
+
+      client.close();
+    });
+  });
+
+  group('SSHClient.runWithResult', () {
+    test('returns command output and exit code', () async {
+      final client = await getTestClient();
+
+      final result = await client.runWithResult('echo dartssh2');
+
+      expect(utf8.decode(result.stdout), contains('dartssh2'));
+      expect(result.output, result.stdout);
+      expect(result.stderr, isEmpty);
+      if (result.exitCode != null) {
+        expect(result.exitCode, 0);
+      }
+      expect(result.exitSignal, isNull);
+
+      client.close();
+    });
+
+    test('returns non-zero exit code for failing command', () async {
+      final client = await getTestClient();
+
+      final result = await client.runWithResult('command-that-does-not-exist');
+
+      expect(result.output, isNotEmpty);
+      if (result.exitCode != null) {
+        expect(result.exitCode, isNot(0));
+      }
+      expect(result.exitSignal, isNull);
+
+      client.close();
     });
   });
 }

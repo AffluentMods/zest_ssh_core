@@ -1,8 +1,9 @@
 import 'dart:typed_data';
 
-import 'package:dartssh2/src/ssh_kex.dart';
-import 'package:dartssh2/src/utils/bigint.dart';
-import 'package:dartssh2/src/utils/list.dart';
+import 'package:zest_ssh_core/src/ssh_errors.dart';
+import 'package:zest_ssh_core/src/ssh_kex.dart';
+import 'package:zest_ssh_core/src/utils/bigint.dart';
+import 'package:zest_ssh_core/src/utils/list.dart';
 
 /// The Diffie-Hellman (DH) key exchange provides a shared secret that
 /// cannot be determined by either party alone.
@@ -47,6 +48,18 @@ class SSHKexDH implements SSHKex {
 
   /// Compute the shared secret K
   BigInt computeSecret(BigInt f) {
+    // Reject a server public value outside the safe range [2, p-2]. Values
+    // like 0, 1, or p-1 produce a degenerate/known shared secret (a
+    // small-subgroup / invalid-value attack); RFC 4253 §8 requires
+    // 1 < f < p-1. A legitimate server always sends f in range, so this
+    // has no effect on real connections.
+    if (f <= BigInt.one || f >= p - BigInt.one) {
+      // SSHError (not FormatException) so the transport's `on SSHError`
+      // handler tears the connection down cleanly and rejects the pending
+      // handshake futures instead of leaking an uncaught async error.
+      throw SSHStateError(
+          'DH server public value out of range (expected 1 < f < p-1)');
+    }
     return f.modPow(x, p);
   }
 }

@@ -1,6 +1,6 @@
 import 'dart:io';
 
-import 'package:dartssh2/dartssh2.dart';
+import 'package:zest_ssh_core/dartssh2.dart';
 
 /// Example of forwarding a local TCP port to a remote Unix domain socket using `ssh -L localPort:remoteSocketPath`.
 void main(List<String> args) async {

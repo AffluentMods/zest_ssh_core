@@ -1,4 +1,7 @@
-import 'package:dartssh2/dartssh2.dart';
+@Tags(['integration'])
+library ssh_socket_io_test;
+
+import 'package:zest_ssh_core/dartssh2.dart';
 import 'package:test/test.dart';
 
 void main() {

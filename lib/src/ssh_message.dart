@@ -1,9 +1,9 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:dartssh2/src/utils/int.dart';
-import 'package:dartssh2/src/utils/bigint.dart';
-import 'package:dartssh2/src/utils/utf8.dart';
+import 'package:zest_ssh_core/src/utils/int.dart';
+import 'package:zest_ssh_core/src/utils/bigint.dart';
+import 'package:zest_ssh_core/src/utils/utf8.dart';
 
 abstract class SSHMessage {
   /// Encode the message to SSH encoded data.
@@ -59,7 +59,15 @@ class SSHMessageReader {
   }
 
   Uint8List readBytes(int length) {
-    final value = Uint8List.view(_byteData.buffer, _offset, length);
+    // sublistView is offset-relative to [data] and bounds-checked; the old
+    // Uint8List.view(_byteData.buffer, ...) indexed the RAW backing buffer,
+    // ignoring [data]'s own byteOffset - so any reader built from a view
+    // (e.g. ByteData.sublistView of a larger packet) read the wrong bytes.
+    if (length < 0 || _offset + length > data.length) {
+      throw RangeError('readBytes out of range: '
+          'offset=$_offset length=$length dataLength=${data.length}');
+    }
+    final value = Uint8List.sublistView(data, _offset, _offset + length);
     _offset += length;
     return value;
   }
@@ -71,8 +79,8 @@ class SSHMessageReader {
     return value;
   }
 
-  String readUtf8() {
-    return utf8.decode(readString());
+  String readUtf8({bool allowMalformed = false}) {
+    return utf8.decode(readString(), allowMalformed: allowMalformed);
   }
 
   List<String> readNameList() {

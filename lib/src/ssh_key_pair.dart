@@ -4,17 +4,20 @@ import 'dart:typed_data';
 
 import 'package:asn1lib/asn1lib.dart';
 import 'package:convert/convert.dart';
-import 'package:dartssh2/dartssh2.dart';
-import 'package:dartssh2/src/hostkey/hostkey_ecdsa.dart';
-import 'package:dartssh2/src/hostkey/hostkey_ed25519.dart';
-import 'package:dartssh2/src/hostkey/hostkey_rsa.dart';
-import 'package:dartssh2/src/ssh_hostkey.dart';
-import 'package:dartssh2/src/ssh_message.dart';
-import 'package:dartssh2/src/utils/bcrypt.dart';
-import 'package:dartssh2/src/utils/cipher_ext.dart';
-import 'package:dartssh2/src/utils/list.dart';
+import 'package:zest_ssh_core/dartssh2.dart';
+import 'package:zest_ssh_core/src/hostkey/hostkey_ecdsa.dart';
+import 'package:zest_ssh_core/src/hostkey/hostkey_ed25519.dart';
+import 'package:zest_ssh_core/src/hostkey/hostkey_ed448.dart';
+import 'package:zest_ssh_core/src/hostkey/hostkey_rsa.dart';
+import 'package:zest_ssh_core/src/ssh_hostkey.dart';
+import 'package:zest_ssh_core/src/ssh_message.dart';
+import 'package:zest_ssh_core/src/utils/bigint.dart';
+import 'package:zest_ssh_core/src/utils/bcrypt.dart';
+import 'package:zest_ssh_core/src/utils/cipher_ext.dart';
+import 'package:zest_ssh_core/src/utils/list.dart';
 import 'package:pinenacl/ed25519.dart' as ed25519;
 import 'package:pointycastle/export.dart';
+import 'package:sign_dart/sign_dart.dart' as sign_dart;
 
 abstract class SSHKeyPair {
   static List<SSHKeyPair> fromPem(String pemText, [String? passphrase]) {
@@ -25,6 +28,9 @@ abstract class SSHKeyPair {
         return pairs.getPrivateKeys(passphrase);
       case 'RSA PRIVATE KEY':
         final pair = RsaKeyPair.decode(pem);
+        return [pair.getPrivateKeys(passphrase)];
+      case 'EC PRIVATE KEY':
+        final pair = EcKeyPair.decode(pem);
         return [pair.getPrivateKeys(passphrase)];
       default:
         throw UnsupportedError('Unsupported key type: ${pem.type}');
@@ -39,6 +45,9 @@ abstract class SSHKeyPair {
         return pairs.isEncrypted;
       case 'RSA PRIVATE KEY':
         final pair = RsaKeyPair.decode(pem);
+        return pair.isEncrypted;
+      case 'EC PRIVATE KEY':
+        final pair = EcKeyPair.decode(pem);
         return pair.isEncrypted;
       default:
         throw UnsupportedError('Unsupported key type: ${pem.type}');
@@ -56,7 +65,22 @@ abstract class SSHKeyPair {
 
   SSHHostKey toPublicKey();
 
+  /// Synchronous signature path. Software keys (RSA / ECDSA / Ed25519
+  /// loaded from PEM) sign in-process with no IO and override this.
+  ///
+  /// Hardware-token / agent-backed keys live in a different process or
+  /// device and require a network round-trip. They override
+  /// [signAsync] instead and throw [UnsupportedError] from this
+  /// method, since the userauth path always awaits [signAsync].
   SSHSignature sign(Uint8List data);
+
+  /// Async signature path. Default implementation defers to [sign] so
+  /// existing software-key implementations stay correct without
+  /// changes. Hardware-token / agent implementations override this
+  /// to do socket / device IO.
+  Future<SSHSignature> signAsync(Uint8List data) async {
+    return sign(data);
+  }
 
   String toPem();
 }
@@ -174,6 +198,9 @@ class OpenSSHKeyPairs {
         case 'ssh-ed25519':
           keypairs.add(OpenSSHEd25519KeyPair.readFrom(reader));
           break;
+        case 'ssh-ed448':
+          keypairs.add(OpenSSHEd448KeyPair.readFrom(reader));
+          break;
         case 'ecdsa-sha2-nistp256':
         case 'ecdsa-sha2-nistp384':
         case 'ecdsa-sha2-nistp521':
@@ -256,6 +283,22 @@ class OpenSSHBcryptKdfOptions implements OpenSSHKdfOptions {
     final reader = SSHMessageReader(data);
     final salt = reader.readString();
     final rounds = reader.readUint32();
+    // Bound the attacker-controlled cost parameters. A malicious .pub/.pem
+    // (or a hostile agent) can set `rounds` to 2^32-1 and the salt to
+    // megabytes; bcrypt_pbkdf is deliberately slow, so decoding such a key
+    // spins the CPU (and, historically, the UI isolate) indefinitely.
+    // ssh-keygen DEFAULTS to 16 rounds, but `-a N` lets a user pick many more
+    // and 100+ is common for hardened keys (`ssh-keygen -a 100`), so the
+    // ceiling must sit well above the default. 1000 keeps every real-world key
+    // working with ~10x headroom over typical hardened values while still
+    // rejecting a DoS-sized value.
+    if (rounds <= 0 || rounds > 1000) {
+      throw FormatException(
+          'OpenSSH key bcrypt rounds out of range: $rounds (expected 1-1000)');
+    }
+    if (salt.length > 1024) {
+      throw FormatException('OpenSSH key bcrypt salt too large: ${salt.length}');
+    }
     return OpenSSHBcryptKdfOptions(salt, rounds);
   }
 
@@ -273,13 +316,19 @@ class OpenSSHBcryptKdfOptions implements OpenSSHKdfOptions {
   }
 }
 
-abstract class OpenSSHKeyPair implements SSHKeyPair {
+mixin OpenSSHKeyPair implements SSHKeyPair {
   void writeTo(SSHMessageWriter writer);
+
+  /// Software keys (RSA, Ed25519, ECDSA loaded from PEM) sign in-process
+  /// with no IO, so the async path just synchronously delegates. Hardware
+  /// / agent-backed keys override [signAsync] in their own implementations.
+  @override
+  Future<SSHSignature> signAsync(Uint8List data) async => sign(data);
 
   @override
   String toPem() {
     final writer = SSHMessageWriter();
-    final checkInt = Random().nextInt(0xFFFFFFFF);
+    final checkInt = Random.secure().nextInt(0xFFFFFFFF);
 
     writer.writeUint32(checkInt);
     writer.writeUint32(checkInt);
@@ -403,6 +452,71 @@ class OpenSSHEd25519KeyPair with OpenSSHKeyPair {
   SSHEd25519Signature sign(Uint8List data) {
     final signer = ed25519.SigningKey.fromValidBytes(privateKey);
     return SSHEd25519Signature(signer.sign(data).asTypedList.sublist(0, 64));
+  }
+
+  @override
+  void writeTo(SSHMessageWriter writer) {
+    writer.writeString(publicKey);
+    writer.writeString(privateKey);
+    writer.writeUtf8(comment);
+  }
+
+  @override
+  String toString() {
+    return '$runtimeType(comment: "$comment")';
+  }
+}
+
+class OpenSSHEd448KeyPair with OpenSSHKeyPair {
+  @override
+  final name = 'ssh-ed448';
+
+  @override
+  final type = 'ssh-ed448';
+
+  /// 57-byte Ed448 public key.
+  final Uint8List publicKey;
+
+  /// 57-byte Ed448 private key seed (or 114-byte seed||pubkey as stored by
+  /// OpenSSH).
+  final Uint8List privateKey;
+
+  final String comment;
+
+  OpenSSHEd448KeyPair(this.publicKey, this.privateKey, this.comment);
+
+  factory OpenSSHEd448KeyPair.readFrom(SSHMessageReader reader) {
+    final publicKey = reader.readString();
+    final privateKey = reader.readString();
+    final comment = reader.readUtf8();
+    return OpenSSHEd448KeyPair(publicKey, privateKey, comment);
+  }
+
+  @override
+  SSHHostKey toPublicKey() {
+    return SSHEd448PublicKey(publicKey);
+  }
+
+  @override
+  SSHEd448Signature sign(Uint8List data) {
+    // OpenSSH stores ed448 private keys as seed (57 bytes) or seed||pub
+    // (114 bytes). sign_dart expects the 57-byte seed.
+    //
+    // WARNING: sign_dart is an unvetted third-party dependency. All outputs
+    // are validated below to guard against implementation flaws.
+    final seed = privateKey.length > 57
+        ? Uint8List.sublistView(privateKey, 0, 57)
+        : privateKey;
+    final curve = sign_dart.TwistedEdwardCurve.ed448();
+    final signer = sign_dart.EdPrivateKey.fromBytes(seed, curve);
+    final sig = signer.sign(data);
+    if (sig.length != 114) {
+      throw StateError(
+        'sign_dart returned invalid Ed448 signature length: '
+        '${sig.length} bytes (expected 114)',
+      );
+    }
+    return SSHEd448Signature(sig);
   }
 
   @override
@@ -694,6 +808,13 @@ class RsaPrivateKey implements SSHKeyPair {
     return SSHRsaSignature(type, signer.generateSignature(data).bytes);
   }
 
+  /// Software RSA: signing is in-process with no IO, so async path
+  /// just delegates to the sync one. Hardware-backed RSA goes through
+  /// `OsAgentKeyPair` (in the app, not this package) which has its
+  /// own async implementation.
+  @override
+  Future<SSHSignature> signAsync(Uint8List data) async => sign(data);
+
   @override
   String toPem() {
     final sequence = ASN1Sequence();
@@ -712,5 +833,113 @@ class RsaPrivateKey implements SSHKeyPair {
   @override
   String toString() {
     return '$runtimeType(version: $version)';
+  }
+}
+
+class EcKeyPair {
+  final RsaKeyPairDEKInfo? dekInfo;
+
+  final Uint8List keyBlob;
+
+  const EcKeyPair(this.dekInfo, this.keyBlob);
+
+  factory EcKeyPair.decode(SSHPem pem) {
+    final dekInfoHeader = pem.headers['DEK-Info'];
+
+    final dekInfo =
+        dekInfoHeader != null ? RsaKeyPairDEKInfo.parse(dekInfoHeader) : null;
+
+    final keyBlob = pem.content;
+
+    return EcKeyPair(dekInfo, keyBlob);
+  }
+
+  bool get isEncrypted => dekInfo != null;
+
+  OpenSSHEcdsaKeyPair getPrivateKeys([String? passphrase]) {
+    if (isEncrypted) {
+      throw UnsupportedError(
+        'Encrypted EC PRIVATE KEY is not supported yet',
+      );
+    }
+
+    if (passphrase != null) {
+      throw ArgumentError('Passphrase is not required for unencrypted keys');
+    }
+
+    try {
+      return _decodeLegacyEcPrivateKey(keyBlob);
+    } catch (e) {
+      throw SSHKeyDecodeError('Failed to decode private key', e);
+    }
+  }
+
+  OpenSSHEcdsaKeyPair _decodeLegacyEcPrivateKey(Uint8List keyBlob) {
+    final parser = ASN1Parser(keyBlob);
+    final sequence = parser.nextObject() as ASN1Sequence;
+
+    if (sequence.elements.length < 2) {
+      throw FormatException('Invalid EC private key sequence');
+    }
+
+    final privateKeyOctets = (sequence.elements[1] as ASN1OctetString).octets;
+    final d = decodeBigIntWithSign(1, privateKeyOctets);
+
+    Uint8List? publicPoint;
+
+    for (var i = 2; i < sequence.elements.length; i++) {
+      final element = sequence.elements[i];
+      if (element.tag == 0xA1) {
+        final inner = ASN1Parser(element.valueBytes()).nextObject();
+        if (inner is ASN1BitString) {
+          publicPoint = inner.contentBytes();
+        }
+      }
+    }
+
+    final curveId =
+        _inferCurveId(publicPoint?.length ?? 0, privateKeyOctets.length);
+    if (curveId == null) {
+      throw UnsupportedError('Unsupported EC PRIVATE KEY curve');
+    }
+
+    final q = publicPoint ?? _derivePublicPoint(curveId, d);
+
+    return OpenSSHEcdsaKeyPair(curveId, q, d, '');
+  }
+
+  String? _inferCurveId(int publicPointLength, int privateKeyLength) {
+    if (publicPointLength == 65 || privateKeyLength == 32) {
+      return 'nistp256';
+    }
+    if (publicPointLength == 97 || privateKeyLength == 48) {
+      return 'nistp384';
+    }
+    if (publicPointLength == 133 || privateKeyLength == 66) {
+      return 'nistp521';
+    }
+    return null;
+  }
+
+  Uint8List _derivePublicPoint(String curveId, BigInt d) {
+    final curve = _curveForId(curveId);
+    final point = curve.G * d;
+    if (point == null) {
+      throw FormatException('Failed to derive public EC point');
+    }
+    return point.getEncoded(false);
+  }
+
+  ECDomainParameters _curveForId(String curveId) {
+    switch (curveId) {
+      case 'nistp256':
+        return ECCurve_secp256r1();
+      case 'nistp384':
+        return ECCurve_secp384r1();
+      case 'nistp521':
+        return ECCurve_secp521r1();
+      default:
+        throw UnsupportedError('Unsupported curve: $curveId');
+    }
   }
 }

@@ -1,48 +1,80 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math' show max;
+import 'dart:math' show Random, max;
 import 'dart:typed_data';
 
-import 'package:dartssh2/src/hostkey/hostkey_ecdsa.dart';
-import 'package:dartssh2/src/hostkey/hostkey_rsa.dart';
-import 'package:dartssh2/src/kex/kex_dh.dart';
-import 'package:dartssh2/src/kex/kex_nist.dart';
-import 'package:dartssh2/src/kex/kex_x25519.dart';
-import 'package:dartssh2/src/message/msg_userauth.dart';
-import 'package:dartssh2/src/ssh_algorithm.dart';
-import 'package:dartssh2/src/ssh_kex.dart';
-import 'package:dartssh2/src/utils/bigint.dart';
-import 'package:dartssh2/src/utils/cipher_ext.dart';
-import 'package:dartssh2/src/utils/chunk_buffer.dart';
-import 'package:dartssh2/src/ssh_kex_utils.dart';
-import 'package:dartssh2/src/ssh_packet.dart';
-import 'package:dartssh2/src/utils/int.dart';
-import 'package:dartssh2/src/hostkey/hostkey_ed25519.dart';
-import 'package:dartssh2/src/utils/list.dart';
-import 'package:dartssh2/src/message/msg_kex.dart';
-import 'package:dartssh2/src/message/msg_kex_dh.dart';
-import 'package:dartssh2/src/message/msg_kex_ecdh.dart';
-import 'package:dartssh2/src/ssh_message.dart';
+import 'package:zest_ssh_core/src/algorithm/ssh_cipher_chacha20_poly1305.dart';
+import 'package:zest_ssh_core/src/hostkey/hostkey_ecdsa.dart';
+import 'package:zest_ssh_core/src/hostkey/hostkey_rsa.dart';
+import 'package:zest_ssh_core/src/kex/kex_dh.dart';
+import 'package:zest_ssh_core/src/kex/kex_nist.dart';
+import 'package:zest_ssh_core/src/kex/kex_x25519.dart';
+import 'package:zest_ssh_core/src/message/msg_userauth.dart';
+import 'package:zest_ssh_core/src/ssh_algorithm.dart';
+import 'package:zest_ssh_core/src/version.dart';
+import 'package:zest_ssh_core/src/ssh_kex.dart';
+import 'package:zest_ssh_core/src/utils/bigint.dart';
+import 'package:zest_ssh_core/src/utils/cipher_ext.dart';
+import 'package:zest_ssh_core/src/utils/chunk_buffer.dart';
+import 'package:zest_ssh_core/src/ssh_kex_utils.dart';
+import 'package:zest_ssh_core/src/ssh_packet.dart';
+import 'package:zest_ssh_core/src/utils/int.dart';
+import 'package:zest_ssh_core/src/hostkey/hostkey_ed25519.dart';
+import 'package:zest_ssh_core/src/hostkey/hostkey_ed448.dart';
+import 'package:zest_ssh_core/src/utils/list.dart';
+import 'package:zest_ssh_core/src/message/msg_kex.dart';
+import 'package:zest_ssh_core/src/message/msg_kex_dh.dart';
+import 'package:zest_ssh_core/src/message/msg_kex_ecdh.dart';
+import 'package:zest_ssh_core/src/ssh_message.dart';
 import 'package:pointycastle/export.dart';
+
+import 'package:zest_ssh_core/src/utils/secure_memory.dart';
 
 import '../dartssh2.dart';
 
 typedef SSHPrintHandler = void Function(String?);
 
-/// Function called when host key is received.
-/// [type] is the type of the host key, For example 'ssh-rsa',
-/// [fingerprint] md5 fingerprint of the host key.
+/// Function called to verify a received host key.
+/// [type] is the type of the host key, for example 'ssh-rsa'.
+/// [keyBlob] is the RAW host public-key blob (the wire encoding) - NOT a
+/// digest - so the app can compute the standard OpenSSH SHA256 fingerprint
+/// that matches `ssh-keygen -lf`, store the real key, and let users verify
+/// out-of-band.
 typedef SSHHostkeyVerifyHandler = FutureOr<bool> Function(
   String type,
-  Uint8List fingerprint,
+  Uint8List keyBlob,
 );
 
 typedef SSHTransportReadyHandler = void Function();
 
 typedef SSHPacketHandler = void Function(Uint8List payload);
 
+/// Called when SSH version strings have been exchanged.
+typedef SSHVersionExchangeHandler = void Function(
+  String localVersion,
+  String remoteVersion,
+);
+
+/// Called when key exchange algorithms have been negotiated.
+typedef SSHKexNegotiatedHandler = void Function({
+  required String kex,
+  required String cipher,
+  required String mac,
+  required String hostKey,
+});
+
+/// Called when key exchange has completed.
+typedef SSHKexCompletedHandler = void Function(Duration duration);
+
+/// Called when the host key has been received with its type and fingerprint.
+typedef SSHHostKeyReceivedHandler = void Function(
+  String keyType,
+  String fingerprint,
+);
+
 class SSHTransport {
-  /// Version of the SSH software. By default "DartSSH_2.0"
+  /// Version of the SSH software sent in the identification banner. Defaults to
+  /// [kDefaultClientIdent] (`"zest_ssh_core_<version>"`).
   final String version;
 
   /// The socket to read and write data to.
@@ -72,6 +104,18 @@ class SSHTransport {
   /// Function called when a packet is received.
   final SSHPacketHandler? onPacket;
 
+  /// Called when SSH version strings have been exchanged.
+  final SSHVersionExchangeHandler? onVersionExchange;
+
+  /// Called when key exchange algorithms have been negotiated.
+  final SSHKexNegotiatedHandler? onKexNegotiated;
+
+  /// Called when key exchange has completed.
+  final SSHKexCompletedHandler? onKexCompleted;
+
+  /// Called when the host key has been received.
+  final SSHHostKeyReceivedHandler? onHostKeyReceived;
+
   final bool disableHostkeyVerification;
 
   /// A [Future] that completes when the transport is closed, or when an error
@@ -89,13 +133,17 @@ class SSHTransport {
   SSHTransport(
     this.socket, {
     this.isServer = false,
-    this.version = 'DartSSH_2.0',
+    this.version = kDefaultClientIdent,
     this.printDebug,
     this.printTrace,
     this.algorithms = const SSHAlgorithms(),
     this.onVerifyHostKey,
     this.onReady,
     this.onPacket,
+    this.onVersionExchange,
+    this.onKexNegotiated,
+    this.onKexCompleted,
+    this.onHostKeyReceived,
     this.disableHostkeyVerification = false,
   }) {
     _initSocket();
@@ -115,7 +163,7 @@ class SSHTransport {
   StreamSubscription? _socketSubscription;
 
   /// Identification string sent by us without trailing \r\n. For example,
-  /// "SSH-2.0-DartSSH_2.0".
+  /// "SSH-2.0-zest_ssh_core_0.1.0".
   String get _localVersion => 'SSH-2.0-$version';
 
   /// Identification string sent by the other side. For example, "SSH-2.0-OpenSSH_7.4p1".
@@ -157,6 +205,14 @@ class SSHTransport {
   /// when the transport is acting as a server.
   var _hostkeyVerified = false;
 
+  /// The exact host-key blob the user verified (or the signature check
+  /// accepted) on the INITIAL key exchange. On every subsequent re-key the
+  /// server's host key must be byte-identical to this - otherwise a MITM that
+  /// seizes the link mid-session could swap in a different key during re-key,
+  /// which we would otherwise accept because host-key verification only runs
+  /// once. Null until the first key exchange completes.
+  Uint8List? _verifiedHostKey;
+
   /// Shared secret derived from the key exchange process. Kept to derive the
   /// cipher IV, cipher key and MAC key.
   BigInt? _sharedSecret;
@@ -167,15 +223,41 @@ class SSHTransport {
   /// A [BlockCipher] to decrypt data sent from the other side.
   BlockCipher? _decryptCipher;
 
+  Uint8List? _localCipherKey;
+
+  Uint8List? _remoteCipherKey;
+
+  Uint8List? _localIV;
+
+  Uint8List? _remoteIV;
+
   /// A [Mac] used to authenticate data sent to the other side.
   Mac? _localMac;
 
   /// A [Mac] used to authenticate data sent from the other side.
   Mac? _remoteMac;
 
+  /// ChaCha20-Poly1305 cipher for encrypting outbound packets.
+  SSHCipherChaCha20Poly1305? _localChaCha;
+
+  /// ChaCha20-Poly1305 cipher for decrypting inbound packets.
+  SSHCipherChaCha20Poly1305? _remoteChaCha;
+
   final _localPacketSN = SSHPacketSN.fromZero();
 
   final _remotePacketSN = SSHPacketSN.fromZero();
+
+  /// Whether this is the initial (first) key exchange. Used for the Terrapin
+  /// attack (CVE-2023-48795) strict KEX mitigation: sequence numbers are reset
+  /// to 0 after the first NEWKEYS when both sides advertise strict KEX.
+  bool _isInitialKex = true;
+
+  /// Whether the server advertised `kex-strict-s-v00@openssh.com` in its
+  /// KEXINIT, indicating support for the Terrapin strict KEX extension.
+  bool _serverSupportsStrictKex = false;
+
+  /// Timestamp when the current key exchange round started.
+  DateTime? _kexStartTime;
 
   /// Whether a key exchange is currently in progress (initial or re-key).
   bool _kexInProgress = false;
@@ -183,6 +265,13 @@ class SSHTransport {
   /// Whether we have already sent our SSH_MSG_KEXINIT for the ongoing key
   /// exchange round. This is reset when the exchange finishes.
   bool _sentKexInit = false;
+
+  /// Tracks the last sequence number used for an inbound ChaCha20-Poly1305
+  /// packet. Used to enforce strict monotonicity (Finding 1.2).
+  int? _lastRemoteChaChaSeq;
+
+  /// Cryptographically secure RNG used for padding bytes.
+  final Random _secureRandom = Random.secure();
 
   /// Packets queued during key exchange that will be sent after NEW_KEYS
   final List<Uint8List> _rekeyPendingPackets = [];
@@ -192,15 +281,72 @@ class SSHTransport {
       throw SSHStateError('Transport is closed');
     }
 
+    // Buffer application packets that arrive mid key-exchange; they are
+    // flushed (encrypted) once NEW_KEYS completes. A buffered packet is NOT
+    // put on the wire now, so it can never travel in cleartext - hence this
+    // runs BEFORE the cleartext guard below, which only concerns packets we
+    // are about to actually transmit.
     if (_kexInProgress && !_shouldBypassRekeyBuffer(data)) {
       _rekeyPendingPackets.add(Uint8List.fromList(data));
       return;
+    }
+
+    // SECURITY: never TRANSMIT a secret-bearing message on an unencrypted
+    // transport.
+    //
+    // Only the transport/KEX exchange legitimately travels in the clear:
+    // ids 1-4 (DISCONNECT/IGNORE/UNIMPLEMENTED/DEBUG), 20-21 (KEXINIT/
+    // NEWKEYS) and the 30-49 KEX-method-specific range (e.g. KEX_ECDH_INIT).
+    // Everything from SERVICE_REQUEST (5) upward carries or leads directly to
+    // secrets - the user-auth password, a public-key signature, then session
+    // data - and must only go out once keys are installed. If a bug or a
+    // hostile peer drives the state machine into sending those before
+    // encryption is established, refuse rather than silently fall back to
+    // plaintext (the old behaviour: `if (_encryptCipher == null) sink.add`).
+    //
+    // Encryption is "established" once ANY local cipher is keyed. AEAD
+    // (AES-GCM) keys `_localCipherKey`, ChaCha20-Poly1305 keys `_localChaCha`,
+    // and block/stream ciphers key `_encryptCipher`. Checking only
+    // `_encryptCipher` (the previous behaviour) wrongly treated a fully
+    // encrypted GCM/ChaCha connection - the defaults - as cleartext and
+    // refused to send any application data over it.
+    final localEncryptionEstablished = _encryptCipher != null ||
+        _localCipherKey != null ||
+        _localChaCha != null;
+    if (!localEncryptionEstablished && data.isNotEmpty) {
+      final messageId = SSHMessage.readMessageId(data);
+      final isKexOrTransport = messageId <= _maxPreHandshakeMessageId ||
+          (messageId >= 20 && messageId <= 49);
+      if (!isKexOrTransport) {
+        throw SSHStateError(
+          'Refusing to send message id $messageId before encryption is '
+          'established - this would transmit credentials in cleartext.',
+        );
+      }
     }
 
     // Check if encryption is enabled and if we have MAC types initialized
     final clientMacType = _clientMacType;
     final serverMacType = _serverMacType;
     final macType = isClient ? clientMacType : serverMacType;
+    final localCipherType = isClient ? _clientCipherType : _serverCipherType;
+
+    // ChaCha20-Poly1305 has its own packet framing with encrypted length
+    if (_localChaCha != null && localCipherType != null && localCipherType.isChaCha) {
+      _sendChaChaPacket(data, localCipherType);
+      _localPacketSN.increase();
+      return;
+    }
+
+    if (localCipherType != null &&
+        localCipherType.isAead &&
+        _localCipherKey != null &&
+        _localIV != null) {
+      _sendAeadPacket(data, localCipherType);
+      _localPacketSN.increase();
+      return;
+    }
+
     final isEtm = _encryptCipher != null && macType != null && macType.isEtm;
 
     // For ETM, we need to handle the packet differently
@@ -234,10 +380,9 @@ class SSHTransport {
       payloadToEncrypt[0] = adjustedPaddingLength; // Set padding length
       payloadToEncrypt.setRange(1, 1 + data.length, data); // Copy data
 
-      // Add random padding
+      // Add random padding using cryptographically secure RNG.
       for (var i = 0; i < adjustedPaddingLength; i++) {
-        payloadToEncrypt[1 + data.length + i] =
-            (DateTime.now().microsecondsSinceEpoch + i) & 0xFF;
+        payloadToEncrypt[1 + data.length + i] = _secureRandom.nextInt(256);
       }
 
       // Verify that the payload length is a multiple of the block size
@@ -293,6 +438,93 @@ class SSHTransport {
     _localPacketSN.increase();
   }
 
+  void _sendAeadPacket(Uint8List data, SSHCipherType cipherType) {
+    final paddingLength =
+        _alignedPaddingLength(data.length, cipherType.blockSize);
+    final packetLength = 1 + data.length + paddingLength;
+
+    final aad = Uint8List(4)..buffer.asByteData().setUint32(0, packetLength);
+
+    final plaintext = Uint8List(packetLength)
+      ..[0] = paddingLength
+      ..setRange(1, 1 + data.length, data);
+
+    for (var i = 0; i < paddingLength; i++) {
+      plaintext[1 + data.length + i] = _secureRandom.nextInt(256);
+    }
+
+    final encrypted = _processAead(
+      key: _localCipherKey!,
+      iv: _localIV!,
+      sequence: _localPacketSN.value,
+      aad: aad,
+      input: plaintext,
+      forEncryption: true,
+    );
+
+    final buffer = BytesBuilder(copy: false)
+      ..add(aad)
+      ..add(encrypted);
+
+    socket.sink.add(buffer.takeBytes());
+  }
+
+  void _sendChaChaPacket(Uint8List data, SSHCipherType cipherType) {
+    final chacha = _localChaCha!;
+    final paddingLength = _alignedPaddingLength(data.length, cipherType.blockSize);
+    final packetLength = 1 + data.length + paddingLength;
+
+    final plaintext = Uint8List(packetLength)
+      ..[0] = paddingLength
+      ..setRange(1, 1 + data.length, data);
+
+    for (var i = 0; i < paddingLength; i++) {
+      plaintext[1 + data.length + i] = _secureRandom.nextInt(256);
+    }
+
+    final encrypted = chacha.encrypt(
+      plaintext,
+      packetLength,
+      _localPacketSN.value,
+    );
+
+    socket.sink.add(encrypted);
+  }
+
+  int _alignedPaddingLength(int payloadLength, int align) {
+    final paddingLength = align - ((payloadLength + 1) % align);
+    return paddingLength < 4 ? paddingLength + align : paddingLength;
+  }
+
+  Uint8List _processAead({
+    required Uint8List key,
+    required Uint8List iv,
+    required int sequence,
+    required Uint8List aad,
+    required Uint8List input,
+    required bool forEncryption,
+  }) {
+    final cipher = GCMBlockCipher(AESEngine());
+    final nonce = _nonceForSequence(iv, sequence);
+    cipher.init(
+      forEncryption,
+      AEADParameters(KeyParameter(key), 128, nonce, aad),
+    );
+    return cipher.process(input);
+  }
+
+  Uint8List _nonceForSequence(Uint8List iv, int sequence) {
+    if (iv.length != 12) {
+      throw ArgumentError.value(iv, 'iv', 'AEAD IV must be 12 bytes long');
+    }
+
+    final nonce = Uint8List.fromList(iv);
+    final view = ByteData.sublistView(nonce);
+    final counter = view.getUint64(4);
+    view.setUint64(4, counter + sequence);
+    return nonce;
+  }
+
   void close() {
     printDebug?.call('SSHTransport.close');
     if (isClosed) return;
@@ -326,9 +558,19 @@ class SSHTransport {
     try {
       _processData();
     } on SSHError catch (e, stackTrace) {
+      printDebug?.call('SSHTransport: SSH error during packet processing: $e');
       closeWithError(e, stackTrace);
-    } catch (e) {
-      rethrow;
+    } catch (e, stackTrace) {
+      // Any NON-SSHError thrown while parsing an incoming packet - e.g. a
+      // RangeError or FormatException from decoding a truncated/crafted field
+      // (readString/readMpint on an attacker-controlled length) during the
+      // still-unauthenticated KEX - must tear the connection down cleanly.
+      // Rethrowing escapes to the zone as an uncaught async error: the
+      // subscription is never cancelled and the connect future never
+      // completes, hanging the client forever (a pre-auth DoS). Wrap it as an
+      // SSHError so `closeWithError` rejects the pending handshake instead.
+      printDebug?.call('SSHTransport: Unexpected error during packet processing: $e\n$stackTrace');
+      closeWithError(SSHPacketError('Malformed packet: $e'), stackTrace);
     }
   }
 
@@ -346,7 +588,11 @@ class SSHTransport {
     if (_remoteVersion == null) {
       _processVersionExchange();
     } else {
-      _processPackets();
+      // Fire-and-forget: [_processPackets] is async (it yields periodically)
+      // and routes any processing error to [closeWithError] internally, so its
+      // future never rejects - unawaited is safe and cannot leak an unhandled
+      // async error.
+      unawaited(_processPackets());
     }
   }
 
@@ -373,7 +619,9 @@ class SSHTransport {
     }
 
     final versionString = bufferString.substring(0, index);
-    if (!versionString.startsWith('SSH-2.0-')) {
+    // RFC compatibility: SSH-1.99 banners indicate SSH-2 support with SSH-1 fallback.
+    if (!(versionString.startsWith('SSH-2.0-') ||
+        versionString.startsWith('SSH-1.99-'))) {
       socket.sink.add(latin1.encode('Protocol mismatch\r\n'));
       throw SSHHandshakeError('Invalid version: $versionString');
     }
@@ -382,31 +630,98 @@ class SSHTransport {
     printDebug?.call('SSHTransport._remoteVersion = "$versionString"');
     _remoteVersion = versionString;
 
+    onVersionExchange?.call(_localVersion, versionString);
+
     if (isServer) {
       _sendKexInit();
     }
 
-    // There maybe more data in the buffer, so process it.
-    _processPackets();
+    // There maybe more data in the buffer, so process it. Fire-and-forget for
+    // the same reason as in [_processData]: the async loop self-handles errors.
+    unawaited(_processPackets());
   }
 
+  /// Whether the remote sequence number was just reset (strict KEX) and
+  /// the automatic post-message increment should be skipped once.
+  bool _skipNextRemoteSNIncrease = false;
+
+  /// Reentrancy guard for [_processPackets]. While the loop is suspended on its
+  /// periodic `await` (see below), more socket data can arrive and its handler
+  /// calls [_processPackets] again; the guard makes that re-entry a no-op.
+  bool _processingPackets = false;
+
+  /// How many packets to dispatch between cooperative yields. Every this-many
+  /// packets the loop hands control back to the event loop so the platform
+  /// message pump / frame scheduler get a slice during a large inbound burst.
+  ///
+  /// Kept SMALL (~128 KB of decrypt at 16 KB/packet) so each burst finishes
+  /// well inside a 16 ms frame even on a slow pure-Dart ChaCha20 path - the file
+  /// list stays scrollable during a big download. A zero-delay yield adds no
+  /// crypto work, so yielding more often costs no throughput; 32 (≈512 KB, ~1-2
+  /// dropped frames per burst) was the visible jank.
+  static const int _packetsPerYield = 8;
+
   /// Process one or more SSH packets queued in [_buffer].
-  void _processPackets() {
-    printDebug?.call('SSHTransport._processPackets');
+  ///
+  /// This is asynchronous purely so it can *cooperatively yield* to the event
+  /// loop during a large inbound burst (e.g. an SFTP download where the
+  /// ChaCha20-Poly1305 decrypt loop would otherwise monopolise the isolate for
+  /// a minute-plus, freezing the UI / window-restore on Windows). Packet
+  /// ordering, framing and decryption are unchanged - the only additions are
+  /// the reentrancy guard, the periodic zero-delay yield, and moving the
+  /// error handling that used to live in [_onSocketData] inside here (async
+  /// errors no longer surface synchronously to that caller).
+  Future<void> _processPackets() async {
+    // See [_processingPackets]: a re-entrant call arriving while we are yielded
+    // must not start a second interleaved loop. It is safe to simply return -
+    // the still-running loop re-reads [_buffer] every iteration (the `while`
+    // condition below evaluates `_buffer.isNotEmpty` afresh), so any data the
+    // re-entrant caller appended is drained by the loop already in progress.
+    if (_processingPackets) return;
+    _processingPackets = true;
 
-    while (_buffer.isNotEmpty && !isClosed) {
-      final payload = _consumePacket();
-      if (payload == null) {
-        break;
+    try {
+      printDebug?.call('SSHTransport._processPackets');
+      var processedSinceYield = 0;
+      while (_buffer.isNotEmpty && !isClosed) {
+        final payload = _consumePacket();
+        if (payload == null) {
+          break;
+        }
+
+        _handleMessage(payload);
+
+        // After a strict-KEX sequence number reset (in _handleMessageNewKeys),
+        // skip one increment so the next encrypted packet uses nonce 0.
+        if (_skipNextRemoteSNIncrease) {
+          _skipNextRemoteSNIncrease = false;
+        } else {
+          _remotePacketSN.increase();
+        }
+
+        // Cooperatively yield after every [_packetsPerYield] packets so a
+        // sustained burst can't starve the platform event loop. The loop
+        // condition re-reads [_buffer] after the await, so data that arrived
+        // during the yield is drained by this same loop (the reentrant call
+        // that appended it was a no-op).
+        if (++processedSinceYield >= _packetsPerYield) {
+          processedSinceYield = 0;
+          await Future<void>.delayed(Duration.zero);
+        }
       }
-
-      // if (payload.length > SSHPacket.maxPayloadLength) {
-      //   throw SSHPacketError('Packet too long: ${payload.length}');
-      // }
-
-      _handleMessage(payload);
-
-      _remotePacketSN.increase();
+    } on SSHError catch (e, stackTrace) {
+      printDebug?.call('SSHTransport: SSH error during packet processing: $e');
+      closeWithError(e, stackTrace);
+    } catch (e, stackTrace) {
+      // Mirror [_onSocketData]: any non-SSHError raised while parsing an
+      // incoming packet (a RangeError/FormatException from a crafted field)
+      // must tear the connection down cleanly rather than escape as an
+      // uncaught async error that hangs the connect future forever.
+      printDebug?.call(
+          'SSHTransport: Unexpected error during packet processing: $e\n$stackTrace');
+      closeWithError(SSHPacketError('Malformed packet: $e'), stackTrace);
+    } finally {
+      _processingPackets = false;
     }
   }
 
@@ -414,7 +729,7 @@ class SSHTransport {
   /// WITHOUT `packet length`, `padding length`, `padding` and `MAC`. Returns
   /// `null` if there is not enough data in the buffer to read the packet.
   Uint8List? _consumePacket() {
-    return _decryptCipher == null
+    return (_decryptCipher == null && _remoteCipherKey == null)
         ? _consumeClearTextPacket()
         : _consumeEncryptedPacket();
   }
@@ -443,6 +758,22 @@ class SSHTransport {
 
   Uint8List? _consumeEncryptedPacket() {
     printDebug?.call('SSHTransport._consumeEncryptedPacket');
+
+    final remoteCipherType = isClient ? _serverCipherType : _clientCipherType;
+
+    // ChaCha20-Poly1305 has its own framing with encrypted length
+    if (remoteCipherType != null &&
+        remoteCipherType.isChaCha &&
+        _remoteChaCha != null) {
+      return _consumeChaChaPacket();
+    }
+
+    if (remoteCipherType != null &&
+        remoteCipherType.isAead &&
+        _remoteCipherKey != null &&
+        _remoteIV != null) {
+      return _consumeAeadPacket(remoteCipherType);
+    }
 
     final blockSize = _decryptCipher!.blockSize;
     if (_buffer.length < blockSize) {
@@ -555,6 +886,101 @@ class SSHTransport {
     }
   }
 
+  Uint8List? _consumeChaChaPacket() {
+    final chacha = _remoteChaCha!;
+
+    // Enforce monotonically increasing sequence numbers (Finding 1.2).
+    final currentSeq = _remotePacketSN.value;
+    if (_lastRemoteChaChaSeq != null && currentSeq <= _lastRemoteChaChaSeq!) {
+      throw SSHPacketError(
+        'ChaCha20 nonce reuse detected: sequence $currentSeq '
+        '<= last $_lastRemoteChaChaSeq',
+      );
+    }
+
+    // Need at least 4 bytes for the encrypted length
+    if (_buffer.length < 4) {
+      return null;
+    }
+
+    // Peek at the encrypted length to determine packet size
+    final encryptedLength = _buffer.view(0, 4);
+    final packetLength = chacha.decryptLength(
+      Uint8List.fromList(encryptedLength),
+      _remotePacketSN.value,
+    );
+    _verifyPacketLength(packetLength);
+
+    // Need: 4 (enc length) + packetLength (enc payload) + 16 (tag)
+    const tagLength = SSHCipherChaCha20Poly1305.tagSize;
+    if (_buffer.length < 4 + packetLength + tagLength) {
+      return null;
+    }
+
+    // Consume all the data
+    final encLenBytes = _buffer.consume(4);
+    final encPayload = _buffer.consume(packetLength);
+    final tag = _buffer.consume(tagLength);
+
+    // Decrypt and verify MAC
+    final plaintext = chacha.decrypt(
+      encLenBytes,
+      encPayload,
+      tag,
+      _remotePacketSN.value,
+    );
+
+    final paddingLength = plaintext[0];
+    final payloadLength = packetLength - paddingLength - 1;
+    _verifyPacketPadding(payloadLength, paddingLength);
+
+    // Record the successfully consumed sequence number for monotonicity.
+    _lastRemoteChaChaSeq = currentSeq;
+
+    return Uint8List.sublistView(plaintext, 1, 1 + payloadLength);
+  }
+
+  Uint8List? _consumeAeadPacket(SSHCipherType cipherType) {
+    if (_buffer.length < 4) {
+      return null;
+    }
+
+    final packetLength = SSHPacket.readPacketLength(_buffer.data);
+    _verifyPacketLength(packetLength);
+
+    final tagLength = cipherType.aeadTagSize;
+    if (_buffer.length < 4 + packetLength + tagLength) {
+      return null;
+    }
+
+    final aad = _buffer.consume(4);
+    final ciphertext = _buffer.consume(packetLength);
+    final tag = _buffer.consume(tagLength);
+
+    final encryptedInput = Uint8List(packetLength + tagLength)
+      ..setRange(0, packetLength, ciphertext)
+      ..setRange(packetLength, packetLength + tagLength, tag);
+
+    late Uint8List plaintext;
+    try {
+      plaintext = _processAead(
+        key: _remoteCipherKey!,
+        iv: _remoteIV!,
+        sequence: _remotePacketSN.value,
+        aad: aad,
+        input: encryptedInput,
+        forEncryption: false,
+      );
+    } on InvalidCipherTextException {
+      throw SSHPacketError('AEAD authentication failed');
+    }
+
+    final paddingLength = plaintext[0];
+    final payloadLength = packetLength - paddingLength - 1;
+    _verifyPacketPadding(payloadLength, paddingLength);
+    return Uint8List.sublistView(plaintext, 1, 1 + payloadLength);
+  }
+
   void _verifyPacketLength(int packetLength) {
     if (packetLength > SSHPacket.maxLength) {
       throw SSHPacketError('Packet too long: $packetLength');
@@ -564,20 +990,69 @@ class SSHTransport {
   /// Verifies that the padding of the packet is correct. Throws [SSHPacketError]
   /// if the padding is incorrect.
   void _verifyPacketPadding(int payloadLength, int paddingLength) {
-    final expectedPacketAlign = _decryptCipher == null
-        ? SSHPacket.minAlign
-        : max(SSHPacket.minAlign, _decryptCipher!.blockSize);
+    // Bound padding BEFORE the alignment math. `paddingLength` is a single
+    // attacker-controlled byte (0-255) and `payloadLength` is derived as
+    // `packetLength - paddingLength - 1`. Without this guard a crafted packet
+    // with an oversized padding byte drives `payloadLength` negative and makes
+    // every caller's `sublistView(packet, 5, packet.length - paddingLength)`
+    // request a negative end index - a RangeError that escapes as an
+    // unhandled zone error instead of a clean protocol teardown. RFC 4253
+    // requires at least 4 padding bytes, and payload can never be negative.
+    if (paddingLength < 4 || payloadLength < 0) {
+      throw SSHPacketError(
+        'Invalid padding: paddingLength=$paddingLength '
+        'payloadLength=$payloadLength',
+      );
+    }
 
-    final minPaddingLength = SSHPacket.paddingLength(
-      payloadLength,
-      align: expectedPacketAlign,
-    );
+    final remoteCipherType = isClient ? _serverCipherType : _clientCipherType;
+    int expectedPacketAlign;
+    if (_decryptCipher != null) {
+      expectedPacketAlign = max(SSHPacket.minAlign, _decryptCipher!.blockSize);
+    } else if (remoteCipherType != null && remoteCipherType.isAead) {
+      expectedPacketAlign = max(SSHPacket.minAlign, remoteCipherType.blockSize);
+    } else {
+      expectedPacketAlign = SSHPacket.minAlign;
+    }
+
+    int minPaddingLength;
+
+    if (remoteCipherType != null &&
+        (remoteCipherType.isChaCha || remoteCipherType.isAead)) {
+      // Both ChaCha20-Poly1305 and AES-GCM exclude the 4-byte packet-length
+      // field from block alignment: ChaCha encrypts it separately, and GCM
+      // carries it as cleartext AAD (RFC 5647). Alignment is therefore over
+      // (1 + payloadLength + paddingLength) only. This mirrors
+      // [_alignedPaddingLength] on the send side; using the generic 5-byte
+      // header formula here (the previous behaviour for AEAD) computed a
+      // different minimum and REJECTED valid AES-GCM packets outright.
+      minPaddingLength =
+          expectedPacketAlign - ((payloadLength + 1) % expectedPacketAlign);
+      if (minPaddingLength < 4) minPaddingLength += expectedPacketAlign;
+    } else {
+      minPaddingLength = SSHPacket.paddingLength(
+        payloadLength,
+        align: expectedPacketAlign,
+      );
+    }
 
     if (paddingLength < minPaddingLength) {
       throw SSHPacketError(
         'Invalid padding length: $paddingLength, expected: $minPaddingLength',
       );
     }
+  }
+
+  /// Length-independent, constant-time byte comparison used for the re-key
+  /// host-key pin. Host keys are public, but comparing in constant time keeps
+  /// the check free of data-dependent timing regardless.
+  static bool _hostKeyBytesEqual(Uint8List a, Uint8List b) {
+    if (a.length != b.length) return false;
+    var diff = 0;
+    for (var i = 0; i < a.length; i++) {
+      diff |= a[i] ^ b[i];
+    }
+    return diff == 0;
   }
 
   /// Verifies that the MAC of the packet is correct. Throws [SSHPacketError]
@@ -630,15 +1105,42 @@ class SSHTransport {
     final cipherType = isClient ? _clientCipherType : _serverCipherType;
     if (cipherType == null) throw StateError('No cipher type selected');
 
+    // Zero old key material before overwriting references (rekey safety).
+    if (_localCipherKey != null) zeroBytes(_localCipherKey!);
+    if (_localIV != null && _localIV!.isNotEmpty) zeroBytes(_localIV!);
+
+    _localCipherKey = _deriveKey(
+      isClient ? SSHDeriveKeyType.clientKey : SSHDeriveKeyType.serverKey,
+      cipherType.keySize,
+    );
+
+    if (cipherType.isChaCha) {
+      // ChaCha20-Poly1305 does not use a derived IV; the nonce is the
+      // sequence number. The 64-byte key is split internally.
+      _localIV = Uint8List(0);
+      _localChaCha = SSHCipherChaCha20Poly1305(key: _localCipherKey!);
+      _encryptCipher = null;
+      _localMac = null;
+      return;
+    }
+
+    // Not ChaCha20 -- clear any stale ChaCha instance from a prior cipher.
+    _localChaCha = null;
+
+    _localIV = _deriveKey(
+      isClient ? SSHDeriveKeyType.clientIV : SSHDeriveKeyType.serverIV,
+      cipherType.ivSize,
+    );
+
+    if (cipherType.isAead) {
+      _encryptCipher = null;
+      _localMac = null;
+      return;
+    }
+
     _encryptCipher = cipherType.createCipher(
-      _deriveKey(
-        isClient ? SSHDeriveKeyType.clientKey : SSHDeriveKeyType.serverKey,
-        cipherType.keySize,
-      ),
-      _deriveKey(
-        isClient ? SSHDeriveKeyType.clientIV : SSHDeriveKeyType.serverIV,
-        cipherType.ivSize,
-      ),
+      _localCipherKey!,
+      _localIV!,
       forEncryption: true,
     );
 
@@ -657,15 +1159,42 @@ class SSHTransport {
     final cipherType = isClient ? _serverCipherType : _clientCipherType;
     if (cipherType == null) throw StateError('No cipher type selected');
 
+    // Zero old key material before overwriting references (rekey safety).
+    if (_remoteCipherKey != null) zeroBytes(_remoteCipherKey!);
+    if (_remoteIV != null && _remoteIV!.isNotEmpty) zeroBytes(_remoteIV!);
+
+    _remoteCipherKey = _deriveKey(
+      isClient ? SSHDeriveKeyType.serverKey : SSHDeriveKeyType.clientKey,
+      cipherType.keySize,
+    );
+
+    if (cipherType.isChaCha) {
+      // ChaCha20-Poly1305 does not use a derived IV; the nonce is the
+      // sequence number. The 64-byte key is split internally.
+      _remoteIV = Uint8List(0);
+      _remoteChaCha = SSHCipherChaCha20Poly1305(key: _remoteCipherKey!);
+      _decryptCipher = null;
+      _remoteMac = null;
+      return;
+    }
+
+    // Not ChaCha20 -- clear any stale ChaCha instance from a prior cipher.
+    _remoteChaCha = null;
+
+    _remoteIV = _deriveKey(
+      isClient ? SSHDeriveKeyType.serverIV : SSHDeriveKeyType.clientIV,
+      cipherType.ivSize,
+    );
+
+    if (cipherType.isAead) {
+      _decryptCipher = null;
+      _remoteMac = null;
+      return;
+    }
+
     _decryptCipher = cipherType.createCipher(
-      _deriveKey(
-        isClient ? SSHDeriveKeyType.serverKey : SSHDeriveKeyType.clientKey,
-        cipherType.keySize,
-      ),
-      _deriveKey(
-        isClient ? SSHDeriveKeyType.serverIV : SSHDeriveKeyType.clientIV,
-        cipherType.ivSize,
-      ),
+      _remoteCipherKey!,
+      _remoteIV!,
       forEncryption: false,
     );
 
@@ -715,6 +1244,10 @@ class SSHTransport {
     required Uint8List exchangeHash,
   }) {
     switch (_hostkeyType) {
+      case SSHHostkeyType.ed448:
+        final publicKey = SSHEd448PublicKey.decode(keyBytes);
+        final signature = SSHEd448Signature.decode(signatureBytes);
+        return publicKey.verify(exchangeHash, signature);
       case SSHHostkeyType.ed25519:
         final publicKey = SSHEd25519PublicKey.decode(keyBytes);
         final signature = SSHEd25519Signature.decode(signatureBytes);
@@ -724,6 +1257,23 @@ class SSHTransport {
       case SSHHostkeyType.rsaSha512:
         final publicKey = SSHRsaPublicKey.decode(keyBytes);
         final signature = SSHRsaSignature.decode(signatureBytes);
+        // RFC 8332: the signature algorithm MUST match the host-key
+        // algorithm negotiated in KEXINIT. Without this check a server can
+        // present a SHA-1 `ssh-rsa` signature even when we negotiated
+        // rsa-sha2-512/256, silently downgrading host authentication to
+        // SHA-1. A compliant server always matches, so reject a mismatch.
+        const expectedSig = {
+          SSHHostkeyType.rsaSha1: SSHRsaSignatureType.sha1,
+          SSHHostkeyType.rsaSha256: SSHRsaSignatureType.sha256,
+          SSHHostkeyType.rsaSha512: SSHRsaSignatureType.sha512,
+        };
+        if (signature.type != expectedSig[_hostkeyType]) {
+          printDebug?.call(
+            'Rejecting host key: RSA signature algorithm "${signature.type}" '
+            'does not match negotiated "${_hostkeyType?.name}" (RFC 8332)',
+          );
+          return false;
+        }
         return publicKey.verify(exchangeHash, signature);
       case SSHHostkeyType.ecdsa256:
       case SSHHostkeyType.ecdsa384:
@@ -751,9 +1301,16 @@ class SSHTransport {
     _kexInProgress = true;
     _sentKexInit = true;
 
+    // Advertise strict KEX extension (Terrapin / CVE-2023-48795 mitigation)
+    // during the initial key exchange only. The extension indicator is a
+    // pseudo-algorithm appended to the kexAlgorithms name list.
+    final kexNames = algorithms.kex.toNameList();
+    if (_isInitialKex && isClient) {
+      kexNames.add('kex-strict-c-v00@openssh.com');
+    }
+
     final message = SSH_Message_KexInit(
-      kexAlgorithms: algorithms.kex.toNameList(),
-      // kexAlgorithms: ['curve25519-sha256'],
+      kexAlgorithms: kexNames,
       serverHostKeyAlgorithms: algorithms.hostkey.toNameList(),
       encryptionClientToServer: algorithms.cipher.toNameList(),
       encryptionServerToClient: algorithms.cipher.toNameList(),
@@ -824,10 +1381,55 @@ class SSHTransport {
     final message = SSH_Message_NewKeys();
     printTrace?.call('-> $socket: $message');
     sendPacket(message.encode());
+
+    // Terrapin (CVE-2023-48795) strict KEX mitigation: reset the SEND
+    // sequence number AFTER sending our NEWKEYS. The receive side is
+    // reset in _handleMessageNewKeys() when we receive the server's.
+    if (_serverSupportsStrictKex) {
+      printDebug?.call('SSHTransport: strict KEX - resetting SEND sequence number');
+      _localPacketSN.reset();
+    }
   }
+
+  /// Highest message id that is legal before the handshake completes.
+  ///
+  /// RFC 4253 §11 reserves 1-4 (DISCONNECT / IGNORE / UNIMPLEMENTED /
+  /// DEBUG) as valid at any time; 20-29 are key exchange and are dispatched
+  /// explicitly below. Everything from SERVICE_ACCEPT (6) upward -
+  /// including all user-auth (50-79) and connection-protocol (80+)
+  /// messages - is only meaningful once keys are in place.
+  static const _maxPreHandshakeMessageId = 4;
 
   void _handleMessage(Uint8List message) {
     final messageId = SSHMessage.readMessageId(message);
+
+    // Terrapin (CVE-2023-48795) strict-KEX enforcement.
+    //
+    // Once strict KEX is negotiated, the INITIAL key exchange must carry
+    // key-exchange traffic and nothing else. OpenSSH's strict-KEX rule
+    // forbids SSH_MSG_IGNORE(2) / UNIMPLEMENTED(3) / DEBUG(4) - and any other
+    // non-KEX message - between the first KEXINIT and the first NEWKEYS,
+    // because permitting them is precisely the packet-injection primitive
+    // Terrapin uses to desynchronise the handshake transcript. Allow only
+    // DISCONNECT(1), KEXINIT(20), NEWKEYS(21) and the method-specific KEX
+    // range (30-49); fail closed on anything else. This is stricter than the
+    // generic pre-handshake gate below (which tolerates ids 1-4), and only
+    // applies while strict KEX is active during the initial exchange.
+    if (_serverSupportsStrictKex && _isInitialKex) {
+      const disconnectId = 1; // SSH_Message_Disconnect.messageId
+      final allowed = messageId == disconnectId ||
+          messageId == SSH_Message_KexInit.messageId || // 20
+          messageId == SSH_Message_NewKeys.messageId || // 21
+          (messageId >= 30 && messageId <= 49); // method-specific KEX
+      if (!allowed) {
+        closeWithError(SSHHandshakeError(
+          'Strict KEX violation: unexpected message id $messageId during the '
+          'initial key exchange (possible Terrapin attack).',
+        ));
+        return;
+      }
+    }
+
     switch (messageId) {
       case SSH_Message_KexInit.messageId:
         return _handleMessageKexInit(message);
@@ -837,6 +1439,28 @@ class SSHTransport {
       case SSH_Message_NewKeys.messageId:
         return _handleMessageNewKeys(message);
       default:
+        // SECURITY: do not hand post-KEX messages to the connection layer
+        // until the host key has been verified.
+        //
+        // Host-key verification is ASYNCHRONOUS - `onVerifyHostKey` shows
+        // the user a "this host is unknown / has changed, accept?" prompt
+        // and we await their answer. Without this gate the transport kept
+        // dispatching whatever the peer sent during that window, so a
+        // man-in-the-middle could push an UNSOLICITED SERVICE_ACCEPT while
+        // the dialog was still on screen. The client took that as "the
+        // server is ready for user-auth" and sent the user's password -
+        // before the user had accepted the key, and before any cipher was
+        // installed, i.e. in cleartext straight to the attacker.
+        //
+        // Anything legal this early is handled above or allowed through
+        // here; everything else is a protocol violation and we fail closed.
+        if (!_hostkeyVerified && messageId > _maxPreHandshakeMessageId) {
+          closeWithError(SSHStateError(
+            'Server sent message id $messageId before host-key verification '
+            'completed - refusing to continue.',
+          ));
+          return;
+        }
         onPacket?.call(message);
     }
   }
@@ -859,6 +1483,15 @@ class SSHTransport {
     final message = SSH_Message_KexInit.decode(payload);
     printTrace?.call('<- $socket: $message');
     _remoteKexInit = payload;
+
+    // Terrapin (CVE-2023-48795): check if server supports strict KEX.
+    if (_isInitialKex && isClient) {
+      _serverSupportsStrictKex = message.kexAlgorithms
+          .contains('kex-strict-s-v00@openssh.com');
+      if (_serverSupportsStrictKex) {
+        printDebug?.call('SSHTransport: server supports strict KEX (Terrapin mitigation)');
+      }
+    }
 
     _kexType = SSHKexUtils.selectAlgorithm(
       localAlgorithms: algorithms.kex,
@@ -892,22 +1525,22 @@ class SSHTransport {
     );
 
     if (_kexType == null) {
-      throw StateError('No matching key exchange algorithm');
+      throw SSHHandshakeError('No matching key exchange algorithm');
     }
     if (_hostkeyType == null) {
-      throw StateError('No matching host key algorithm');
+      throw SSHHandshakeError('No matching host key algorithm');
     }
     if (_clientCipherType == null) {
-      throw StateError('No matching client cipher algorithm');
+      throw SSHHandshakeError('No matching client cipher algorithm');
     }
     if (_serverCipherType == null) {
-      throw StateError('No matching server cipher algorithm');
+      throw SSHHandshakeError('No matching server cipher algorithm');
     }
-    if (_clientMacType == null) {
-      throw StateError('No matching client MAC algorithm');
+    if (_clientMacType == null && !_clientCipherType!.isAead) {
+      throw SSHHandshakeError('No matching client MAC algorithm');
     }
-    if (_serverMacType == null) {
-      throw StateError('No matching server MAC algorithm');
+    if (_serverMacType == null && !_serverCipherType!.isAead) {
+      throw SSHHandshakeError('No matching server MAC algorithm');
     }
 
     printDebug?.call('SSHTransport._kexType: $_kexType');
@@ -916,6 +1549,14 @@ class SSHTransport {
     printDebug?.call('SSHTransport._serverCipherType: $_serverCipherType');
     printDebug?.call('SSHTransport._clientMacType: $_clientMacType');
     printDebug?.call('SSHTransport._serverMacType: $_serverMacType');
+
+    _kexStartTime = DateTime.now();
+    onKexNegotiated?.call(
+      kex: _kexType!.name,
+      cipher: _clientCipherType?.name ?? 'none',
+      mac: _clientMacType?.name ?? 'none',
+      hostKey: _hostkeyType!.name,
+    );
 
     switch (_kexType) {
       case SSHKexType.x25519:
@@ -1022,11 +1663,29 @@ class SSHTransport {
       if (!verified) throw SSHHostkeyError('Signature verification failed');
     }
 
+    // Re-key host-key pinning: after the initial exchange the server's host
+    // key is fixed for the lifetime of the connection. A byte-for-byte
+    // mismatch on any later KEX means the peer we're talking to changed -
+    // a MITM takeover - so tear down rather than silently accept it. The
+    // signature check above proves the key owns the exchange, but NOT that
+    // it is the SAME key the user already trusted; this closes that gap.
+    final pinnedHostKey = _verifiedHostKey;
+    if (pinnedHostKey != null && !_hostKeyBytesEqual(pinnedHostKey, hostkey)) {
+      closeWithError(SSHHostkeyError('Host key changed during re-key'));
+      return;
+    }
+
     _exchangeHash = exchangeHash;
     _sessionId ??= exchangeHash;
     _sharedSecret = sharedSecret;
 
     final fingerprint = MD5Digest().process(hostkey);
+
+    // Format fingerprint as colon-separated hex for event reporting.
+    final fingerprintHex = fingerprint
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join(':');
+    onHostKeyReceived?.call(_hostkeyType!.name, fingerprintHex);
 
     if (_hostkeyVerified) {
       _sendNewKeys();
@@ -1034,8 +1693,10 @@ class SSHTransport {
       return;
     }
 
+    // Pass the RAW host key blob (not the MD5 digest) so the app computes
+    // the standard OpenSSH SHA256 fingerprint and stores the real key.
     final userVerified = onVerifyHostKey != null
-        ? onVerifyHostKey!(_hostkeyType!.name, fingerprint)
+        ? onVerifyHostKey!(_hostkeyType!.name, hostkey)
         : true;
 
     Future.value(userVerified).then(
@@ -1044,6 +1705,8 @@ class SSHTransport {
           closeWithError(SSHHostkeyError('Hostkey verification failed'));
         } else {
           _hostkeyVerified = true;
+          // Pin the accepted key so every later re-key is checked against it.
+          _verifiedHostKey = Uint8List.fromList(hostkey);
           _sendNewKeys();
           _applyLocalKeys();
           onReady?.call();
@@ -1062,6 +1725,18 @@ class SSHTransport {
     final message = SSH_Message_KexDH_GexGroup.decode(payload);
     printTrace?.call('<- $socket: $message');
 
+    // Validate the server-chosen prime size (RFC 4419). Without this a
+    // malicious server could pick a tiny, easily-broken modulus and
+    // downgrade the DH strength while we believe we negotiated a strong
+    // group. Enforce the same [min, max] window the client requested.
+    final pBits = message.p.bitLength;
+    if (pBits < SSHKexDH.gexMin || pBits > SSHKexDH.gexMax) {
+      // SSHStateError (an SSHError) so `on SSHError` handles the teardown
+      // cleanly, rather than a FormatException leaking to the zone.
+      throw SSHStateError('DH group-exchange prime size $pBits bits out of '
+          'range [${SSHKexDH.gexMin}, ${SSHKexDH.gexMax}]');
+    }
+
     _kex = SSHKexDH(p: message.p, g: message.g, secretBits: 256);
     _sendKexDHGexInit();
   }
@@ -1072,10 +1747,34 @@ class SSHTransport {
 
     _applyRemoteKeys();
 
+    // Terrapin (CVE-2023-48795) strict KEX mitigation: reset the RECEIVE
+    // sequence number after receiving server's NEWKEYS. The SEND sequence
+    // number is reset separately in _sendNewKeys() after we send ours.
+    // Each direction resets independently per the strict KEX spec.
+    //
+    // We also set _skipNextRemoteSNIncrease because _processPackets()
+    // increments _remotePacketSN AFTER this handler returns. Without
+    // skipping that increment, the first encrypted packet would be
+    // decrypted with nonce=1 instead of nonce=0.
+    if (_isInitialKex && _serverSupportsStrictKex) {
+      printDebug?.call('SSHTransport: strict KEX - resetting RECEIVE sequence number');
+      _remotePacketSN.reset();
+      _skipNextRemoteSNIncrease = true;
+    }
+    _isInitialKex = false;
+
     // Key exchange round finished.
     _kexInProgress = false;
     _sentKexInit = false;
     _kex = null;
+
+    // Report kex completion with duration.
+    final startTime = _kexStartTime;
+    if (startTime != null) {
+      final duration = DateTime.now().difference(startTime);
+      onKexCompleted?.call(duration);
+      _kexStartTime = null;
+    }
 
     // Flush any pending packets
     final pending = List<Uint8List>.from(_rekeyPendingPackets);

@@ -3,12 +3,12 @@ import 'dart:math';
 
 import 'dart:typed_data';
 
-import 'package:dartssh2/src/ssh_channel_id.dart';
-import 'package:dartssh2/src/ssh_transport.dart';
-import 'package:dartssh2/src/utils/async_queue.dart';
-import 'package:dartssh2/src/message/msg_channel.dart';
-import 'package:dartssh2/src/ssh_message.dart';
-import 'package:dartssh2/src/utils/stream.dart';
+import 'package:zest_ssh_core/src/ssh_channel_id.dart';
+import 'package:zest_ssh_core/src/ssh_transport.dart';
+import 'package:zest_ssh_core/src/utils/async_queue.dart';
+import 'package:zest_ssh_core/src/message/msg_channel.dart';
+import 'package:zest_ssh_core/src/ssh_message.dart';
+import 'package:zest_ssh_core/src/utils/stream.dart';
 
 /// Handler of channel requests. Return true if the request was handled, false
 /// if the request was not recognized or could not be handled.
@@ -120,6 +120,36 @@ class SSHChannelController {
     return await _requestReplyQueue.next;
   }
 
+  Future<bool> sendX11Req({
+    bool singleConnection = false,
+    String authenticationProtocol = 'MIT-MAGIC-COOKIE-1',
+    required String authenticationCookie,
+    int screenNumber = 0,
+  }) async {
+    sendMessage(
+      SSH_Message_Channel_Request.x11(
+        recipientChannel: remoteId,
+        wantReply: true,
+        singleConnection: singleConnection,
+        x11AuthenticationProtocol: authenticationProtocol,
+        x11AuthenticationCookie: authenticationCookie,
+        x11ScreenNumber: screenNumber.toString(),
+      ),
+    );
+    return await _requestReplyQueue.next;
+  }
+
+  Future<bool> sendAgentForwardingRequest() async {
+    sendMessage(
+      SSH_Message_Channel_Request(
+        recipientChannel: remoteId,
+        requestType: SSHChannelRequestType.authAgent,
+        wantReply: true,
+      ),
+    );
+    return await _requestReplyQueue.next;
+  }
+
   Future<bool> sendSubsystem(String subsystem) async {
     sendMessage(
       SSH_Message_Channel_Request.subsystem(
@@ -131,7 +161,7 @@ class SSHChannelController {
     return await _requestReplyQueue.next;
   }
 
-  void sendEnv(String name, String value) {
+  Future<bool> sendEnv(String name, String value) async {
     sendMessage(
       SSH_Message_Channel_Request.env(
         recipientChannel: remoteId,
@@ -140,6 +170,7 @@ class SSHChannelController {
         wantReply: true,
       ),
     );
+    return await _requestReplyQueue.next;
   }
 
   void sendSignal(String signal) {
@@ -241,12 +272,20 @@ class SSHChannelController {
       return;
     }
 
-    _remoteStream.add(SSHChannelData(data, type: type));
-
     _localWindow -= data.length;
     if (_localWindow < 0) {
-      // Maybe we should close the channel here?
+      // The remote side sent more data than allowed by our receive window.
+      // This violates RFC 4254 Section 5.2. Destroy the channel to prevent
+      // buffer exhaustion attacks.
+      printDebug?.call(
+        'SSHChannel: remote exceeded local window by ${-_localWindow} bytes, '
+        'destroying channel',
+      );
+      destroy();
+      return;
     }
+
+    _remoteStream.add(SSHChannelData(data, type: type));
 
     _sendWindowAdjustIfNeeded();
   }
@@ -415,6 +454,20 @@ class SSHChannel {
     return await _controller.sendShell();
   }
 
+  Future<bool> sendX11Req({
+    bool singleConnection = false,
+    String authenticationProtocol = 'MIT-MAGIC-COOKIE-1',
+    required String authenticationCookie,
+    int screenNumber = 0,
+  }) async {
+    return await _controller.sendX11Req(
+      singleConnection: singleConnection,
+      authenticationProtocol: authenticationProtocol,
+      authenticationCookie: authenticationCookie,
+      screenNumber: screenNumber,
+    );
+  }
+
   void sendTerminalWindowChange({
     required int width,
     required int height,
@@ -518,12 +571,30 @@ class OnceSimultaneously {
 
   var _isRunning = false;
 
-  /// Call the function. If the function is already running, this is a no-op.
+  /// Set when [activate] is called while [_fn] is already running. We MUST
+  /// remember it and re-run once the current pass finishes - dropping it is a
+  /// lost wakeup. In the channel upload pump that manifests as a hung
+  /// transfer: the loop exits on `_remoteWindow <= 0`, the peer's
+  /// WINDOW_ADJUST races back in before `_isRunning` clears (routine on a
+  /// low-latency LAN), the old code's `if (_isRunning) return` swallowed the
+  /// re-activation, and the buffered upload data was never sent again - the
+  /// transfer stalls forever even though window is now available.
+  var _pending = false;
+
+  /// Call the function. If it is already running, mark that it must run again
+  /// as soon as the current pass completes, coalescing any number of
+  /// activations during a run into a single re-run.
   void activate() async {
-    if (_isRunning) return;
+    if (_isRunning) {
+      _pending = true;
+      return;
+    }
     _isRunning = true;
     try {
-      await _fn();
+      do {
+        _pending = false;
+        await _fn();
+      } while (_pending);
     } finally {
       _isRunning = false;
     }

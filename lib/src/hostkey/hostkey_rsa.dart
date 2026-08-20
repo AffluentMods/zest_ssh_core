@@ -1,8 +1,8 @@
 import 'dart:typed_data';
 
 import 'package:convert/convert.dart';
-import 'package:dartssh2/src/ssh_hostkey.dart';
-import 'package:dartssh2/src/ssh_message.dart';
+import 'package:zest_ssh_core/src/ssh_hostkey.dart';
+import 'package:zest_ssh_core/src/ssh_message.dart';
 
 import 'package:pinenacl/ed25519.dart';
 import 'package:pointycastle/api.dart' hide Signature;
@@ -12,6 +12,8 @@ import 'package:pointycastle/digests/sha256.dart';
 import 'package:pointycastle/digests/sha512.dart';
 import 'package:pointycastle/random/fortuna_random.dart';
 import 'package:pointycastle/signers/rsa_signer.dart';
+
+import '../utils/list.dart';
 
 class SSHRsaPublicKey implements SSHHostKey {
   static const type = 'ssh-rsa';
@@ -65,7 +67,9 @@ class SSHRsaPublicKey implements SSHHostKey {
         PublicKeyParameter<asymmetric.RSAPublicKey>(
           asymmetric.RSAPublicKey(n, e),
         ),
-        FortunaRandom(),
+        // Seed the PRNG with cryptographically secure random bytes.
+        // An unseeded FortunaRandom produces deterministic output.
+        FortunaRandom()..seed(KeyParameter(randomBytes(32))),
       ),
     );
 

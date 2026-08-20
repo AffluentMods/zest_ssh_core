@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import 'package:dartssh2/src/kex/kex_x25519.dart';
+import 'package:zest_ssh_core/src/kex/kex_x25519.dart';
 import 'package:test/test.dart';
 
 void main() {

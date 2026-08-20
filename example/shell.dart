@@ -1,7 +1,7 @@
 import 'dart:io';
 import 'dart:typed_data';
 
-import 'package:dartssh2/dartssh2.dart';
+import 'package:zest_ssh_core/dartssh2.dart';
 
 void main(List<String> args) async {
   final socket = await SSHSocket.connect('localhost', 22);
@@ -17,9 +17,15 @@ void main(List<String> args) async {
   );
 
   final shell = await client.shell();
-  stdout.addStream(shell.stdout);
-  stderr.addStream(shell.stderr);
-  stdin.cast<Uint8List>().listen(shell.write);
+
+  // GUI-launched apps may not have local stdio attached.
+  final hasTerminal =
+      stdin.hasTerminal && stdout.hasTerminal && stderr.hasTerminal;
+  if (hasTerminal) {
+    stdout.addStream(shell.stdout);
+    stderr.addStream(shell.stderr);
+    stdin.cast<Uint8List>().listen(shell.write);
+  }
 
   await shell.done;
 

@@ -1,4 +1,4 @@
-import 'package:dartssh2/src/ssh_algorithm.dart';
+import 'package:zest_ssh_core/src/ssh_algorithm.dart';
 
 class SSHHostkeyType extends SSHAlgorithm {
   static const rsaSha1 = SSHHostkeyType._('ssh-rsa');
@@ -8,6 +8,7 @@ class SSHHostkeyType extends SSHAlgorithm {
   static const ecdsa384 = SSHHostkeyType._('ecdsa-sha2-nistp384');
   static const ecdsa521 = SSHHostkeyType._('ecdsa-sha2-nistp521');
   static const ed25519 = SSHHostkeyType._('ssh-ed25519');
+  static const ed448 = SSHHostkeyType._('ssh-ed448');
 
   const SSHHostkeyType._(this.name);
 

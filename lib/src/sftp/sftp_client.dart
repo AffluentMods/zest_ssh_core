@@ -3,21 +3,25 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:convert/convert.dart';
-import 'package:dartssh2/src/sftp/sftp_errors.dart';
-import 'package:dartssh2/src/sftp/sftp_file_attrs.dart';
-import 'package:dartssh2/src/sftp/sftp_file_open_mode.dart';
-import 'package:dartssh2/src/sftp/sftp_name.dart';
-import 'package:dartssh2/src/sftp/sftp_packet.dart';
-import 'package:dartssh2/src/sftp/sftp_packet_ext.dart';
-import 'package:dartssh2/src/sftp/sftp_request_id.dart';
-import 'package:dartssh2/src/sftp/sftp_statvfs.dart';
-import 'package:dartssh2/src/sftp/sftp_stream_io.dart';
-import 'package:dartssh2/src/ssh_channel.dart';
-import 'package:dartssh2/src/ssh_transport.dart';
-import 'package:dartssh2/src/utils/chunk_buffer.dart';
-import 'package:dartssh2/src/ssh_message.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_errors.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_file_attrs.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_file_open_mode.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_name.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_packet.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_packet_ext.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_request_id.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_statvfs.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_stream_io.dart';
+import 'package:zest_ssh_core/src/ssh_channel.dart';
+import 'package:zest_ssh_core/src/ssh_transport.dart';
+import 'package:zest_ssh_core/src/utils/chunk_buffer.dart';
+import 'package:zest_ssh_core/src/ssh_message.dart';
 
 const _kVersion = 3;
+const _kReadChunkSize = 16 * 1024;
+const _kReadMaxPendingRequests = 64;
+const _kDownloadChunkSize = 64 * 1024;
+const _kDownloadMaxPendingRequests = 128;
 
 class SftpClient {
   final SSHChannel _channel;
@@ -68,6 +72,38 @@ class SftpClient {
     if (reply is SftpHandlePacket) return SftpFile(this, reply.handle);
     if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
     throw SftpStatusError.fromStatus(reply);
+  }
+
+  /// Downloads a remote file from [path] into [destination].
+  ///
+  /// This is a convenience API built on top of [SftpFile.read] and keeps the
+  /// existing stream-based APIs fully compatible.
+  ///
+  /// Returns the total number of bytes written.
+  Future<int> download(
+    String path,
+    StreamSink<List<int>> destination, {
+    int? length,
+    int offset = 0,
+    void Function(int bytesRead)? onProgress,
+    int chunkSize = _kDownloadChunkSize,
+    int maxPendingRequests = _kDownloadMaxPendingRequests,
+    bool closeDestination = false,
+  }) async {
+    final file = await open(path, mode: SftpFileOpenMode.read);
+    try {
+      return await file.downloadTo(
+        destination,
+        length: length,
+        offset: offset,
+        onProgress: onProgress,
+        chunkSize: chunkSize,
+        maxPendingRequests: maxPendingRequests,
+        closeDestination: closeDestination,
+      );
+    } finally {
+      await file.close();
+    }
   }
 
   /// Reads the items of a directory. Returns an [Stream] of [SftpName] chunks.
@@ -169,12 +205,24 @@ class SftpClient {
   }
 
   /// Close the sftp session.
+  ///
+  /// Also tears down the underlying channel: without that, every
+  /// open/close cycle of the SFTP subsystem left a channel open on the
+  /// server for the lifetime of the SSH connection, and any file or
+  /// directory handles opened through it were never released. Closing is
+  /// idempotent so a double close (an explicit `close()` after the peer
+  /// already went away) is a no-op rather than a "Future already
+  /// completed" crash.
   void close() {
+    if (_done.isCompleted) return;
     for (var waiter in _replyWaiters.values) {
       waiter.completeError(SftpAbortError("Connection closed"));
     }
     _replyWaiters.clear();
     _done.complete();
+    // Fire-and-forget: the caller's close() is synchronous by contract and
+    // a failure here only means the channel was already gone.
+    _channel.close().catchError((_) {});
   }
 
   void _closeError(Object error, [StackTrace? stackTrace]) {
@@ -544,9 +592,20 @@ class SftpFile {
     int? length,
     int offset = 0,
     void Function(int bytesRead)? onProgress,
+    int chunkSize = _kReadChunkSize,
+    int maxPendingRequests = _kReadMaxPendingRequests,
   }) async* {
-    const chunkSize = 16 * 1024;
-    const maxBytesOnTheWire = chunkSize * 64;
+    _mustNotBeClosed();
+    if (chunkSize <= 0) {
+      throw ArgumentError.value(chunkSize, 'chunkSize', 'must be positive');
+    }
+    if (maxPendingRequests <= 0) {
+      throw ArgumentError.value(
+        maxPendingRequests,
+        'maxPendingRequests',
+        'must be positive',
+      );
+    }
 
     // Get the file size if not specified.
     if (length == null) {
@@ -566,61 +625,74 @@ class SftpFile {
       throw SftpError('Length must be positive: $length');
     }
 
-    final streamController = StreamController<Uint8List>();
+    final endOffset = offset + length;
+    final pendingReads = <Future<Uint8List?>>[];
+    var nextOffset = offset;
+    var bytesRead = 0;
 
-    var bytessRecieved = 0;
-    var bytessRequested = 0;
-
-    Future<void> readChunk(int chunkStart) async {
-      final chunkEnd = min(chunkStart + chunkSize, offset + length!);
-      final chunkLength = chunkEnd - chunkStart;
-
-      bytessRequested += chunkLength;
-
-      late final Uint8List? chunk;
-
-      try {
-        chunk = await _readChunk(chunkLength, chunkStart);
-      } catch (e, st) {
-        if (!streamController.isClosed) {
-          streamController.addError(e, st);
-          streamController.close();
-        }
-        return;
+    while (bytesRead < length) {
+      while (
+          nextOffset < endOffset && pendingReads.length < maxPendingRequests) {
+        final requestLength = min(chunkSize, endOffset - nextOffset);
+        pendingReads.add(_readChunk(requestLength, nextOffset));
+        nextOffset += requestLength;
       }
 
-      if (chunk == null) {
-        streamController.close();
-        return;
+      if (pendingReads.isEmpty) break;
+
+      final chunk = await pendingReads.removeAt(0);
+      if (chunk == null) break;
+      if (chunk.isEmpty) {
+        throw SftpError('Unexpected empty data chunk before EOF');
       }
 
-      streamController.add(chunk);
-      bytessRecieved += chunkLength;
+      final remaining = length - bytesRead;
+      final outputChunk = chunk.length <= remaining
+          ? chunk
+          : Uint8List.sublistView(chunk, 0, remaining);
 
-      if (onProgress != null) onProgress(bytessRecieved);
+      yield outputChunk;
 
-      if (bytessRecieved >= length) {
-        streamController.close();
-        return;
+      bytesRead += outputChunk.length;
+      onProgress?.call(bytesRead);
+    }
+  }
+
+  /// Downloads this file into [destination].
+  ///
+  /// Returns the total number of bytes written.
+  Future<int> downloadTo(
+    StreamSink<List<int>> destination, {
+    int? length,
+    int offset = 0,
+    void Function(int bytesRead)? onProgress,
+    int chunkSize = _kDownloadChunkSize,
+    int maxPendingRequests = _kDownloadMaxPendingRequests,
+    bool closeDestination = false,
+  }) async {
+    _mustNotBeClosed();
+    var bytesRead = 0;
+
+    try {
+      await destination.addStream(
+        read(
+          length: length,
+          offset: offset,
+          onProgress: (value) {
+            bytesRead = value;
+            onProgress?.call(value);
+          },
+          chunkSize: chunkSize,
+          maxPendingRequests: maxPendingRequests,
+        ),
+      );
+    } finally {
+      if (closeDestination) {
+        await destination.close();
       }
     }
 
-    void scheduleRead() {
-      if (streamController.isPaused || streamController.isClosed) {
-        return;
-      }
-
-      while (bytessRequested < length!) {
-        final bytesOnTheWire = bytessRequested - bytessRecieved;
-        if (bytesOnTheWire >= maxBytesOnTheWire) return;
-        readChunk(bytessRequested + offset).then((_) => scheduleRead());
-      }
-    }
-
-    streamController.onListen = scheduleRead;
-    streamController.onResume = scheduleRead;
-
-    yield* streamController.stream;
+    return bytesRead;
   }
 
   /// Reads at most [length] bytes from the file starting at [offset]. If
@@ -693,11 +765,37 @@ class SftpFile {
 
   Future<Uint8List?> _readChunk(int length, [int offset = 0]) async {
     _mustNotBeClosed();
-    final reply = await _client._sendRead(_handle, offset, length);
-    if (reply is SftpDataPacket) return reply.data;
-    if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
-    SftpStatusError.check(reply);
-    return null;
+    final first = await _client._sendRead(_handle, offset, length);
+    if (first is! SftpDataPacket) {
+      if (first is! SftpStatusPacket) throw SftpError('Unexpected reply');
+      SftpStatusError.check(first); // throws on error; EOF/OK falls through
+      return null;
+    }
+    // Fast path: the server returned the whole chunk (the usual case).
+    if (first.data.length >= length || first.data.isEmpty) return first.data;
+
+    // Short read. SSH_FXP_READ is explicitly allowed to return FEWER bytes
+    // than requested, and the read loop above advances its offset by the full
+    // requested length - so if we hand back a short buffer, the gap between
+    // what arrived and the next offset is never re-requested and the download
+    // is silently corrupted and truncated. Re-request the shortfall at the
+    // advanced offset until the chunk is filled or the server signals EOF.
+    final out = BytesBuilder();
+    out.add(first.data);
+    var got = first.data.length;
+    while (got < length) {
+      final reply = await _client._sendRead(_handle, offset + got, length - got);
+      if (reply is SftpDataPacket) {
+        if (reply.data.isEmpty) break;
+        out.add(reply.data);
+        got += reply.data.length;
+        continue;
+      }
+      if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
+      SftpStatusError.check(reply); // throws on error; EOF ends the fill
+      break;
+    }
+    return out.toBytes();
   }
 
   void _mustNotBeClosed() {

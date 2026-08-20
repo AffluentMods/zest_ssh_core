@@ -3,20 +3,23 @@ import 'dart:math';
 import 'dart:typed_data';
 
 Uint8List randomBytes(int length) {
-  final random = Random();
+  final random = Random.secure();
   final bytes = Uint8List(length);
   for (var i = 0; i < length; i++) {
-    bytes[i] = random.nextInt(255);
+    bytes[i] = random.nextInt(256);
   }
   return bytes;
 }
 
-extension ListX<T> on List<T> {
-  bool equals(List<T> other) {
-    if (other.length != length) return false;
+extension ListX on List<int> {
+  /// Constant-time comparison to prevent timing side-channel attacks during
+  /// MAC verification. Every byte is always compared regardless of mismatches.
+  bool equals(List<int> other) {
+    if (length != other.length) return false;
+    int result = 0;
     for (int i = 0; i < length; i++) {
-      if (this[i] != other[i]) return false;
+      result |= this[i] ^ other[i];
     }
-    return true;
+    return result == 0;
   }
 }

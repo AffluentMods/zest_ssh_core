@@ -1,8 +1,9 @@
 import 'dart:typed_data';
 
-import 'package:dartssh2/src/ssh_kex.dart';
-import 'package:dartssh2/src/utils/bigint.dart';
-import 'package:dartssh2/src/utils/list.dart';
+import 'package:zest_ssh_core/src/ssh_errors.dart';
+import 'package:zest_ssh_core/src/ssh_kex.dart';
+import 'package:zest_ssh_core/src/utils/bigint.dart';
+import 'package:zest_ssh_core/src/utils/list.dart';
 import 'package:pinenacl/tweetnacl.dart';
 
 class SSHKexX25519 implements SSHKexECDH {
@@ -21,6 +22,18 @@ class SSHKexX25519 implements SSHKexECDH {
   @override
   BigInt computeSecret(Uint8List remotePublicKey) {
     final secret = _ScalarMult.scalseMult(privateKey, remotePublicKey);
+    // Reject an all-zero shared secret: X25519 yields all zeros when the
+    // peer's public value is a low-order point (RFC 7748 §6.1). Accepting it
+    // would let a MITM force a fully-known key. Constant-time OR-accumulate.
+    var acc = 0;
+    for (final b in secret) {
+      acc |= b;
+    }
+    if (acc == 0) {
+      // SSHError so the transport tears down cleanly (see kex_dh.dart).
+      throw SSHStateError(
+          'X25519 produced an all-zero shared secret (low-order point)');
+    }
     return decodeBigIntWithSign(1, secret);
   }
 }

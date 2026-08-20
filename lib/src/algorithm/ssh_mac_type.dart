@@ -1,6 +1,6 @@
 import 'dart:typed_data';
 
-import 'package:dartssh2/src/ssh_algorithm.dart';
+import 'package:zest_ssh_core/src/ssh_algorithm.dart';
 import 'package:pointycastle/export.dart';
 
 import '../utils/truncated_hmac.dart';

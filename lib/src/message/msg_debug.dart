@@ -2,7 +2,7 @@
 
 import 'dart:typed_data';
 
-import 'package:dartssh2/src/ssh_message.dart';
+import 'package:zest_ssh_core/src/ssh_message.dart';
 
 class SSH_Message_Debug implements SSHMessage {
   static const messageId = 4;

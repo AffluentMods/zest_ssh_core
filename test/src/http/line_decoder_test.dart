@@ -1,6 +1,6 @@
 import 'dart:convert';
 
-import 'package:dartssh2/src/http/line_decoder.dart';
+import 'package:zest_ssh_core/src/http/line_decoder.dart';
 import 'package:test/test.dart';
 
 void main() {

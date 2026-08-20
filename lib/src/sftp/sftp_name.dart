@@ -1,5 +1,5 @@
-import 'package:dartssh2/src/sftp/sftp_file_attrs.dart';
-import 'package:dartssh2/src/ssh_message.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_file_attrs.dart';
+import 'package:zest_ssh_core/src/ssh_message.dart';
 
 class SftpName {
   final String filename;
@@ -15,8 +15,8 @@ class SftpName {
   });
 
   factory SftpName.readFrom(SSHMessageReader reader) {
-    final filename = reader.readUtf8();
-    final longname = reader.readUtf8();
+    final filename = reader.readUtf8(allowMalformed: true);
+    final longname = reader.readUtf8(allowMalformed: true);
     final attr = SftpFileAttrs.readFrom(reader);
     return SftpName(
       filename: filename,

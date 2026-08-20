@@ -1,7 +1,7 @@
 import 'dart:typed_data';
 
-import 'package:dartssh2/src/sftp/sftp_packet.dart';
-import 'package:dartssh2/src/ssh_message.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_packet.dart';
+import 'package:zest_ssh_core/src/ssh_message.dart';
 
 /// Represents the payload of an extended request. Should be wrapped in a
 /// [SftpExtendedPacket] before being sent.

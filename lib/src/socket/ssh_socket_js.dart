@@ -1,13 +1,14 @@
-import 'package:dartssh2/src/socket/ssh_socket.dart';
+import 'package:zest_ssh_core/src/socket/ssh_socket.dart';
 
 Future<SSHSocket> connectNativeSocket(
   String host,
   int port, {
   Duration? timeout,
 }) async {
-  throw UnimplementedError(
-    'Native socket is not supported on web. '
-    'To use dartssh2 in browser, you have to bring your own implementation '
-    'of SSHSocket.',
+  throw UnsupportedError(
+    'SSHSocket.connect($host, $port) is not supported on web. '
+    'Browsers cannot open raw TCP sockets. '
+    'Use a custom SSHSocket transport over a browser-supported channel '
+    '(for example, a WebSocket tunnel/proxy to an SSH endpoint).',
   );
 }

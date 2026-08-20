@@ -1,4 +1,8 @@
+import 'dart:math' show Random;
 import 'dart:typed_data';
+
+/// Cryptographically secure RNG shared across packet operations.
+final Random _secureRandom = Random.secure();
 
 /// Contains rfc4253 packet format related constants and helper functions.
 abstract class SSHPacket {
@@ -37,7 +41,11 @@ abstract class SSHPacket {
   }
 
   /// Returns a rfc4253 packet built from [payload] and [align] including the
-  /// length field, padding length field, and padding. Withouth the MAC.
+  /// length field, padding length field, and padding. Without the MAC.
+  ///
+  /// Padding bytes are filled with cryptographically secure random data to
+  /// prevent information leakage via predictable padding (RFC 4253 Section 6:
+  /// "random padding ... SHOULD be random").
   static Uint8List pack(Uint8List payload, {required int align}) {
     final padding = paddingLength(payload.length, align: align);
     final header = ByteData(5);
@@ -46,7 +54,14 @@ abstract class SSHPacket {
     final result = BytesBuilder(copy: false);
     result.add(Uint8List.view(header.buffer));
     result.add(payload);
-    result.add(Uint8List(padding));
+    // RFC 4253 Section 6: padding SHOULD consist of random bytes.
+    // Using all-zero padding leaks information about the cipher state.
+    final paddingBytes = Uint8List(padding);
+    final rng = _secureRandom;
+    for (var i = 0; i < padding; i++) {
+      paddingBytes[i] = rng.nextInt(256);
+    }
+    result.add(paddingBytes);
     return result.takeBytes();
   }
 }
@@ -68,5 +83,13 @@ class SSHPacketSN {
     } else {
       _value++;
     }
+  }
+
+  /// Reset the sequence number to zero.
+  ///
+  /// Used by the Terrapin (CVE-2023-48795) strict KEX mitigation to reset
+  /// both local and remote sequence numbers after the initial key exchange.
+  void reset() {
+    _value = 0;
   }
 }

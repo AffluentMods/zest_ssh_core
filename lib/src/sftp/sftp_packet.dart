@@ -1,9 +1,9 @@
 import 'dart:typed_data';
 
 import 'package:convert/convert.dart';
-import 'package:dartssh2/src/sftp/sftp_file_attrs.dart';
-import 'package:dartssh2/src/sftp/sftp_name.dart';
-import 'package:dartssh2/src/ssh_message.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_file_attrs.dart';
+import 'package:zest_ssh_core/src/sftp/sftp_name.dart';
+import 'package:zest_ssh_core/src/ssh_message.dart';
 
 //  SSH_FXP_INIT                1   init
 //  SSH_FXP_VERSION             2   init-reply
@@ -60,7 +60,7 @@ class SftpInitPacket implements SftpPacket {
     reader.readUint8(); // packet type
     final version = reader.readUint32();
     final extensions = <String, String>{};
-    while (reader.isDone) {
+    while (!reader.isDone) {
       final name = reader.readUtf8();
       final value = reader.readUtf8();
       extensions[name] = value;
@@ -1031,7 +1031,7 @@ class SftpExtendedReplyPacket implements SftpResponsePacket {
     final writer = SSHMessageWriter();
     writer.writeUint8(packetType);
     writer.writeUint32(requestId);
-    writer.writeString(payload);
+    writer.writeBytes(payload);
     return writer.takeBytes();
   }
 
