@@ -3,7 +3,7 @@
 [![test](https://github.com/AffluentMods/zest_ssh_core/actions/workflows/test.yml/badge.svg)](https://github.com/AffluentMods/zest_ssh_core/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A pure-Dart SSH and SFTP library, forked from [dartssh2](https://github.com/TerminalStudio/dartssh2) and hardened for use in [ZestSSH](https://zestssh.com).
+A pure-Dart SSH and SFTP library, forked from [dartssh2](https://github.com/vicajilau/dartssh2) and hardened for use in [ZestSSH](https://zestssh.com).
 
 The reason it is public: the code that talks to your servers should be code you can read. This is the exact SSH stack ZestSSH ships, nothing stripped out for the open-source version. If you want to know how the client authenticates, what it negotiates, or how it handles a host key, it is all here.
 
@@ -11,9 +11,9 @@ MIT licensed, free to use, and staying that way.
 
 ## Relationship to dartssh2
 
-This started as a fork of dartssh2 by TerminalStudio, which is also MIT. The upstream license is kept in `LICENSE`.
+This started as a fork of dartssh2, which is also MIT. dartssh2 was originally written by xuty ([TerminalStudio/dartssh2](https://github.com/TerminalStudio/dartssh2)) and is now maintained at [vicajilau/dartssh2](https://github.com/vicajilau/dartssh2), which is what this repo forks. The upstream license and copyright are kept in `LICENSE`.
 
-Fork point: dartssh2 `<FILL IN: exact upstream version or commit>`. The GitHub "forked from" header and the compare view show the full diff against upstream, so you can see every change rather than taking this README's word for it.
+Fork point: dartssh2 `2.14.0`. The GitHub "forked from" header and the [compare view](https://github.com/vicajilau/dartssh2/compare/v2.14.0...AffluentMods:zest_ssh_core:zest) show the full diff against that exact upstream release, so you can see every change rather than taking this README's word for it.
 
 What changed, at a glance:
 
