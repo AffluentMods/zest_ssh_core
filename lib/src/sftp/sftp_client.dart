@@ -23,6 +23,15 @@ const _kReadMaxPendingRequests = 64;
 const _kDownloadChunkSize = 64 * 1024;
 const _kDownloadMaxPendingRequests = 128;
 
+/// Upper bound on a single server-advertised SFTP packet length. Without it a
+/// hostile or compromised server can claim a multi-gigabyte packet and stream
+/// junk, and the client reassembles it in memory until it runs out (the
+/// application-level byte caps all sit downstream of this reassembly buffer).
+/// 64 MB is far above any legitimate SFTP packet, DATA is bounded by the 64 KB
+/// download chunk and a NAME/readdir batch is far smaller, while still keeping
+/// the buffer bounded. A packet over this cap tears the session down cleanly.
+const _kMaxPacketLength = 64 * 1024 * 1024;
+
 class SftpClient {
   final SSHChannel _channel;
 
@@ -464,14 +473,29 @@ class SftpClient {
   }
 
   void _handleData(SSHChannelData data) {
-    _buffer.add(data.bytes);
-    _handlePackets();
+    // A malformed or oversized packet from the server must tear the SFTP
+    // session down cleanly. This runs in a stream listener with no onError, so
+    // an uncaught throw here would surface as an unhandled zone error and can
+    // crash the isolate. Instead, fail every pending request and close.
+    try {
+      _buffer.add(data.bytes);
+      _handlePackets();
+    } catch (e, st) {
+      if (!_done.isCompleted) {
+        _closeError(e, st);
+        _channel.close().catchError((_) {});
+      }
+    }
   }
 
   void _handlePackets() {
     const lengthHeader = 4; // 4 bytes packet length header
     while (_buffer.length >= lengthHeader) {
       final length = _buffer.byteData.getUint32(0);
+      if (length > _kMaxPacketLength) {
+        throw SftpError(
+            'SFTP packet length $length exceeds maximum $_kMaxPacketLength');
+      }
       if (_buffer.length < lengthHeader + length) break;
       final packet = _buffer.consume(lengthHeader + length);
       final payload = Uint8List.sublistView(packet, lengthHeader);
@@ -480,6 +504,11 @@ class SftpClient {
   }
 
   void _handlePacket(Uint8List payload) {
+    // A zero-length packet leaves nothing to read the type byte from; reject it
+    // rather than throwing a bare RangeError on payload[0].
+    if (payload.isEmpty) {
+      throw SftpError('Empty SFTP packet');
+    }
     final type = payload[0];
     switch (type) {
       case SftpVersionPacket.packetType:
