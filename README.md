@@ -63,7 +63,30 @@ final client = SSHClient(
 
 ## Maintenance
 
-Upstream dartssh2 security fixes are tracked and merged. The reason to keep this a real fork rather than a rewrite is exactly that: when something lands upstream, it can be pulled in instead of reimplemented. Anything out of scope for a security fix stays close to upstream so those merges keep working.
+Upstream dartssh2 is tracked, and its security and correctness fixes are merged. Keeping this a real
+fork rather than a rewrite is exactly why: when something lands upstream it can be pulled in instead of
+reimplemented. Anything out of scope for a security fix stays close to upstream so those merges keep
+working.
+
+Being a fork does not mean following upstream blindly. Where upstream takes a direction that is wrong
+for this library, it is not taken, and the reason is written down rather than left implicit.
+
+The record so far, last audited 2026-08-19 against upstream 3.3.0:
+
+| Upstream change | Status here |
+| --- | --- |
+| SFTP short read causing silent data loss | Merged |
+| P-521 ECDH scalar generated one byte short | Merged |
+| Per-handshake `Isolate.run` offload for key exchange (2.20.0+) | Not taken. It costs several times more than the curve operation it hides and can lose a race against a server's handshake timeout (upstream issue #226). This fork has always computed X25519 and the NIST curves synchronously, which is what upstream reverted to. |
+| 3.0.0 API changes (`SSHClient.identities`, `close()`) | Not applicable, this fork has its own surface |
+
+Divergence from upstream's current defaults is deliberate: upstream now prefers AES-GCM in its default
+cipher list and has dropped the truncated 96-bit MACs, while this library leads with
+ChaCha20-Poly1305 and still offers the truncated MACs last. Both are defensible; the table in
+[Security posture](#security-posture) is the authority for what this library actually negotiates.
+
+`CHANGELOG.md` is this fork's history. Upstream's history up to the fork point is preserved in
+`CHANGELOG-dartssh2.md`.
 
 ## Usage
 

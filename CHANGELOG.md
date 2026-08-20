@@ -1,201 +1,53 @@
-## [2.14.0] - 2026-03-19
-- Fixed SSH connections through bastion hosts where the target server sends its version string immediately upon connection (which is standard behavior per RFC 4253) [#141]. Thanks @shihuili1218.
-- Adds a new forwardLocalUnix() function, which is an equivalent of ssh -L localPort:remoteSocketPath [#140]. Thanks @isegal.
+# Changelog
 
+This is the changelog for `zest_ssh_core`. For the history of dartssh2 up to the fork point, see
+`CHANGELOG-dartssh2.md`.
 
-## [2.13.0] - 2025-06-22
-- docs: Update NoPorts naming [#115]. [@XavierChanth].
-- Add parameter disableHostkeyVerification [#123]. Thanks [@alexander-irion].
-- Add support for server initiated re-keying [#125]. Thanks [@MarBazuz].
-- Add support for new algorithms "mac-sha2-256-96", "hmac-sha2-512-96", "hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com" [#126] [#127]. Thanks [@reinbeumer].
+## 0.1.0 - 2026-08-19
 
-## [2.12.0] - 2025-02-08
-- Fixed streams and channel not closing after receiving SSH_Message_Channel_Close [#116]. [@cbenhagen].
-- Fixed lint issues.
-- Added tests.
-- Updated dependencies.
+First public release of the fork. Forked from dartssh2 `2.14.0`.
 
-## [2.11.0] - 2024-11-19
-- Fixed Type 'Uint8' not found issue.
+### Hardened defaults
 
-## [2.10.0] - 2024-08-29
-- Improved Readme.
-- Bug fix in SftpFileWriter for [#50], [#71], [#100].
-- Added DartShell product [#101].
-- Fixed dynamic return on SftpFileOpenMode in | operator [#80].
-- DCM updated.
-- Fixed warnings related with new DCM version.
-- Dependencies updated.
-- Fixed Flutter 3.24 issue.
+Weak algorithms are still implemented, but a connection no longer offers them unless the caller opts
+in with a custom `SSHAlgorithms` profile.
 
-## [2.9.1-pre] - 2023-04-02
-- Make the type of `SSHForwardChannel.sink` to `StreamSink<List<int>>` to match
-  its super class.
-- Added `SSHHttpClient` for easy http request forwarding.
+- Removed from default key exchange: `diffie-hellman-group1-sha1`, `diffie-hellman-group14-sha1`,
+  `diffie-hellman-group-exchange-sha1`. SHA-1 is collision broken, so strong defaults must not be
+  negotiable down to it.
+- Removed from default host keys: `ssh-rsa` (SHA-1 signatures).
+- Removed from default ciphers: all CBC modes (CVE-2008-5161 plaintext recovery when not paired with
+  ETM MACs).
+- Removed from default MACs: `hmac-md5`.
+- Encrypt-then-MAC variants are preferred over plain HMAC, and AES-256 is preferred over AES-128.
 
-## [2.9.0-pre] - 2023-03-31
-- Better handling of channel close.
-- Make `SSHForwardChannel` implement `SSHSocket` for better interoperability.
+### Added
 
-## [2.8.2] - 2023-03-07
-- Make `SftpFileWriter` implement `Future<void>` for backward compatibility.
+- `chacha20-poly1305@openssh.com` AEAD cipher.
+- Strict key exchange (`kex-strict-c-v00@openssh.com`), which is the mitigation for Terrapin
+  (CVE-2023-48795).
+- SSH certificate authentication.
+- Ed448 host key support (implemented, not offered by default).
+- AES-GCM ciphers (implemented, not offered by default).
+- Client identification string `zest_ssh_core_<version>`, so this library is identifiable in server
+  logs and scan results rather than being attributed to upstream.
 
-## [2.8.1] - 2023-03-07
-- Export `SftpFileWriter`
+### Security fixes
 
-## [2.8.0] - 2023-03-06
-- `SftpFile.write` now returns a `SftpFileWriter` that can be used to control
-  the writing process.
-- Support `SftpClient.statvfs` and `SftpFile.statvfs`.
-- Support automatic keepalive.
+- ECDH now validates the peer's public key before using it: the point must be well formed, not the
+  point at infinity, and actually on the negotiated curve. Without this check a malicious server can
+  mount an invalid-curve attack and recover the ephemeral private key over repeated connections. A
+  degenerate shared secret (0 or 1) is also rejected.
+- One-time Poly1305 keys are zeroed immediately after use.
+- SFTP read no longer loses data when a server returns fewer bytes than requested. The protocol
+  explicitly permits a short read; the previous loop advanced its offset by the full requested length,
+  so the gap was never re-requested and the download was silently truncated. Merged from upstream.
+- P-521 ECDH private scalars are drawn from the full 521-bit range. The previous byte calculation
+  produced 520 bits. Merged from upstream.
 
-## 2.7.3
-- Update README.md
-- Move cli into separate package.
-- Properly handle chunk read error during stream read.
+### Deliberately not taken from upstream
 
-## 2.7.2+3
-- Update README.md
-
-## 2.7.2+2
-- Update README.md
-
-## 2.7.2+1
-- Update README.md
-
-## 2.7.2
-- Upgrade `pinenacl` to `0.5.0`.
-- Fix bug in exporting openssh private key to pem, thanks [@PIDAMI]
-
-## 2.7.1
-- Upgrade rsa authentication algorithm to rsa-sha2-256.
-
-## 2.7.0
-- Support encrypted RSA format private key
-
-## 2.6.1
-- Allow username with `@` in `dartssh2` command [#24]
-
-## 2.6.0
-- Allow ignoring stdout or stderr in `SSHClient.run`.
-- Add `SSHAuthFailError` and `SSHAuthAbortError`.
-- Fix file type detection.
-- Fix empty identity handling [#21]
-- Add connection reset handing.
-- Add more tests
-
-## 2.5.0
-- Fix js import path [#18].
-- Ignore remote data after channel closed.
-
-## 2.4.4
-- Fix lint errors
-
-## 2.4.3
-- Remove unused dependencies
-- Fix lint errors
-
-## 2.4.2
-- Fix null check error in `kill()` [#17]
-- More examples in README.md
-## 2.4.1
-- More examples in README.md
-- Limit the maximum size of channel packets
-
-## 2.4.0
-- Support session stdin streaming and EOF
-
-## 2.3.1
-- Support ssh v2 when version string does not contain CR [#14], thanks [@Migarl]
-
-## 2.3.1-pre
-- Add remoteVersion field to SSHClient
-
-## 2.3.0-pre
-- Add description field in SSHChannelOpenError
-
-## 2.2.0
-- Update README.md
-- Support export keypair to PEM
-
-## 2.1.0-pre
-- Update README.md
-- Support loading OpenSSH encrypted pem files.
-
-## 2.0.0-pre
-- Implements local port forwarding
-- Implements remote port forwarding
-- Implements SFTP client
-- More supported algorithms
-- Added `dartsftp` command
-
-## 1.2.0-pre
-
-- Rework login logic.
-- `dartssh` command now supports login with public key.
-
-## 1.1.4-pre
-
-- `dartssh` command now supports terminal window resize.
-
-## 1.1.3-pre
-
-- Add `--verbose` option in `dartssh` command.
-
-## 1.1.2-pre
-
-- Fix typos.
-
-## 1.1.1-pre
-
-- Organize exports.
-## 1.1.0-pre
-
-- Dependency update.
-- Sound null safety.
-- Replace deprecated `pedantic` with `package:lints`
-- Fix crash running vim by [@linhanyu].  [#1]
-
-## 1.0.4+4
-
-- Increase test coverage and documentation.
-
-## 1.0.3+3
-
-- Fix tunneled WebSocket issue.
-
-## 1.0.2+2
-
-- Add example/README.md
-
-## 1.0.1+1
-
-- Add SSHTunneledSocketImpl, SSHTunneledWebSocketImpl, and SSHTunneledBaseClient.
-
-## 1.0.0+0
-
-- Initial release.
-
-[#127]: https://github.com/TerminalStudio/dartssh2/pull/127
-[#126]: https://github.com/TerminalStudio/dartssh2/pull/126
-[#125]: https://github.com/TerminalStudio/dartssh2/pull/125
-[#123]: https://github.com/TerminalStudio/dartssh2/pull/123
-[#101]: https://github.com/TerminalStudio/dartssh2/pull/101
-[#100]: https://github.com/TerminalStudio/dartssh2/issues/100
-[#80]: https://github.com/TerminalStudio/dartssh2/issues/80
-[#71]: https://github.com/TerminalStudio/dartssh2/issues/71
-[#50]: https://github.com/TerminalStudio/dartssh2/issues/50
-[#24]: https://github.com/TerminalStudio/dartssh2/issues/24
-[#21]: https://github.com/TerminalStudio/dartssh2/issues/21
-[#18]: https://github.com/TerminalStudio/dartssh2/issues/18
-[#17]: https://github.com/TerminalStudio/dartssh2/issues/17
-[#14]: https://github.com/TerminalStudio/dartssh2/pull/14
-[#1]: https://github.com/TerminalStudio/dartssh/pull/1/files
-
-[@linhanyu]: https://github.com/linhanyu
-[@Migarl]: https://github.com/Migarl
-[@PIDAMI]: https://github.com/PIDAMI
-[@XavierChanth]: https://github.com/XavierChanth
-[@MarBazuz]: https://github.com/MarBazuz
-[@reinbeumer]: https://github.com/reinbeumer
-[@alexander-irion]: https://github.com/alexander-irion
+- The per-handshake `Isolate.run` offload of key exchange (upstream 2.20.0 through 3.3.0). Spawning an
+  isolate per connection costs several times more than the curve operation it hides, and it can lose a
+  race against a server's handshake timeout (upstream issue #226). This fork computes X25519 and the
+  NIST curves synchronously, which is what upstream reverted to.
