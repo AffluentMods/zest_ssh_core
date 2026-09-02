@@ -7,12 +7,21 @@ import 'package:zest_ssh_core/src/utils/stream.dart';
 /// The amount of data to send in a single SFTP packet.
 ///
 /// From the SFTP spec it's safe to send up to 32KB of data in a single packet.
-/// To strike a balance between capability and performance, we choose 16KB.
-const chunkSize = 16 * 1024;
+/// We use 32KB: versus 16KB it halves the number of AWAITED SFTP write
+/// round-trips per MB (64 -> 32), which is what lifts throughput against the
+/// per-chunk RTT ceiling. Note it does NOT reduce SSH-layer work: a 32768-byte
+/// write is 32797 bytes on the channel once the SFTP header and file handle
+/// are added, so it exceeds OpenSSH's 32768-byte channel packet limit and is
+/// split into a full packet plus a small tail, leaving the encrypt/MAC count
+/// per MB unchanged. Reducing that would mean sizing the payload to
+/// remoteMaximumPacketSize minus the header, or negotiating
+/// limits@openssh.com.
+const chunkSize = 32 * 1024;
 
 /// The maximum amount of data that can be sent to the remote host without
-/// receiving an acknowledgement.
-const maxBytesOnTheWire = chunkSize * 64;
+/// receiving an acknowledgement. Kept at 1MB (32 x 32KB) so doubling the chunk
+/// size does not widen the in-flight window or the encrypt burst.
+const maxBytesOnTheWire = chunkSize * 32;
 
 /// Holds the state of a streaming write operation from [stream] to [file].
 class SftpFileWriter with DoneFuture {
@@ -72,7 +81,9 @@ class SftpFileWriter with DoneFuture {
   ///
   /// Calling [abort] will make [done] to complete immediately.
   Future<void> abort() async {
-    _doneCompleter.complete();
+    if (!_doneCompleter.isCompleted) {
+      _doneCompleter.complete();
+    }
     await _subscription.cancel();
   }
 
@@ -99,27 +110,40 @@ class SftpFileWriter with DoneFuture {
   /// progress callback. Finally, it checks if all data has been acknowledged
   /// and completes the operation if done.
   Future<void> _handleLocalData(Uint8List chunk) async {
-    if (_bytesOnTheWire >= maxBytesOnTheWire) {
-      _subscription.pause();
-    } else {
-      _subscription.resume();
-    }
+    try {
+      if (_bytesOnTheWire >= maxBytesOnTheWire) {
+        _subscription.pause();
+      } else {
+        _subscription.resume();
+      }
 
-    final chunkWriteOffset = offset + _bytesSent;
-    _bytesSent += chunk.length;
-    await file.writeBytes(chunk, offset: chunkWriteOffset);
+      final chunkWriteOffset = offset + _bytesSent;
+      _bytesSent += chunk.length;
+      await file.writeBytes(chunk, offset: chunkWriteOffset);
 
-    _bytesAcked += chunk.length;
-    onProgress?.call(_bytesAcked);
+      _bytesAcked += chunk.length;
+      onProgress?.call(_bytesAcked);
 
-    if (_bytesOnTheWire < maxBytesOnTheWire) {
-      _subscription.resume();
-    }
+      if (_bytesOnTheWire < maxBytesOnTheWire) {
+        _subscription.resume();
+      }
 
-    if (_streamDone &&
-        _bytesSent == _bytesAcked &&
-        !_doneCompleter.isCompleted) {
-      _doneCompleter.complete();
+      if (_streamDone &&
+          _bytesSent == _bytesAcked &&
+          !_doneCompleter.isCompleted) {
+        _doneCompleter.complete();
+      }
+    } catch (e, st) {
+      // A rejected WRITE (ENOSPC, revoked permission, SSH_FX_FAILURE) or a
+      // client close mid-write used to be swallowed by the fire-and-forget
+      // listen() handler, leaving [done] hanging forever. Surface it so the
+      // upload FAILS instead of stalling; the .zestpart staging plus
+      // size-verify-and-rename above this layer means the remote file is
+      // never left half-written.
+      if (!_doneCompleter.isCompleted) {
+        _doneCompleter.completeError(e, st);
+      }
+      await _subscription.cancel();
     }
   }
 
@@ -131,7 +155,7 @@ class SftpFileWriter with DoneFuture {
   /// if no more data remains to be processed.
   void _handleLocalDone() {
     _streamDone = true;
-    if (_bytesSent == _bytesAcked) {
+    if (_bytesSent == _bytesAcked && !_doneCompleter.isCompleted) {
       _doneCompleter.complete();
     }
   }

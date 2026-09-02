@@ -4,6 +4,8 @@ import 'dart:math' show Random, max;
 import 'dart:typed_data';
 
 import 'package:zest_ssh_core/src/algorithm/ssh_cipher_chacha20_poly1305.dart';
+import 'package:zest_ssh_core/src/algorithm/ssh_send_crypto.dart';
+import 'package:zest_ssh_core/src/send_crypto_worker.dart';
 import 'package:zest_ssh_core/src/hostkey/hostkey_ecdsa.dart';
 import 'package:zest_ssh_core/src/hostkey/hostkey_rsa.dart';
 import 'package:zest_ssh_core/src/kex/kex_dh.dart';
@@ -145,10 +147,18 @@ class SSHTransport {
     this.onKexCompleted,
     this.onHostKeyReceived,
     this.disableHostkeyVerification = false,
+    this.offloadSendCrypto = false,
   }) {
     _initSocket();
     _startHandshake();
   }
+
+  /// When true, ChaCha20-Poly1305 and AES-GCM send-side packet encryption runs
+  /// on a background worker isolate instead of the main isolate, so bulk SFTP
+  /// uploads no longer block the UI. Purely an optimization: the inline path is
+  /// always correct, and a spawn failure silently falls back to it. Default
+  /// false so existing behavior and the library's own tests are unchanged.
+  final bool offloadSendCrypto;
 
   final _doneCompleter = Completer<void>();
 
@@ -276,6 +286,18 @@ class SSHTransport {
   /// Packets queued during key exchange that will be sent after NEW_KEYS
   final List<Uint8List> _rekeyPendingPackets = [];
 
+  // ── Send-crypto offload (opt-in via offloadSendCrypto) ──────────────
+  // Worker isolate that encrypts ChaCha/GCM packets off the main isolate. Null
+  // until the first offloadable key install; stays null forever if a spawn
+  // fails (inline fallback). The sequence number stays owned here, on the main
+  // isolate, and is passed per packet, so a nonce can never desync.
+  SendCryptoWorker? _sendWorker;
+  bool _spawningSendWorker = false;
+  int _nextSendJobId = 0; // monotonic id, assigned in submit order
+  int _nextExpectedWriteJobId = 0; // ordering guard for the deferred write
+  int _sendEpoch = 0; // bumped each offloadable key install
+  ({int epoch, String mode, Uint8List key, Uint8List iv})? _pendingSendInstall;
+
   void sendPacket(Uint8List data) {
     if (isClosed) {
       throw SSHStateError('Transport is closed');
@@ -333,7 +355,11 @@ class SSHTransport {
 
     // ChaCha20-Poly1305 has its own packet framing with encrypted length
     if (_localChaCha != null && localCipherType != null && localCipherType.isChaCha) {
-      _sendChaChaPacket(data, localCipherType);
+      if (_sendWorker != null) {
+        _enqueueSendOffload(data, localCipherType, gcm: false);
+      } else {
+        _sendChaChaPacket(data, localCipherType);
+      }
       _localPacketSN.increase();
       return;
     }
@@ -342,7 +368,11 @@ class SSHTransport {
         localCipherType.isAead &&
         _localCipherKey != null &&
         _localIV != null) {
-      _sendAeadPacket(data, localCipherType);
+      if (_sendWorker != null) {
+        _enqueueSendOffload(data, localCipherType, gcm: true);
+      } else {
+        _sendAeadPacket(data, localCipherType);
+      }
       _localPacketSN.increase();
       return;
     }
@@ -453,24 +483,17 @@ class SSHTransport {
       plaintext[1 + data.length + i] = _secureRandom.nextInt(256);
     }
 
-    final encrypted = _processAead(
-      key: _localCipherKey!,
-      iv: _localIV!,
-      sequence: _localPacketSN.value,
-      aad: aad,
-      input: plaintext,
-      forEncryption: true,
-    );
-
-    final buffer = BytesBuilder(copy: false)
-      ..add(aad)
-      ..add(encrypted);
-
-    socket.sink.add(buffer.takeBytes());
+    // Same pure function the crypto worker runs (aad + GCM ciphertext + tag).
+    socket.sink.add(encryptGcmPacket(
+      _localCipherKey!,
+      _localIV!,
+      _localPacketSN.value,
+      aad,
+      plaintext,
+    ));
   }
 
   void _sendChaChaPacket(Uint8List data, SSHCipherType cipherType) {
-    final chacha = _localChaCha!;
     final paddingLength = _alignedPaddingLength(data.length, cipherType.blockSize);
     final packetLength = 1 + data.length + paddingLength;
 
@@ -482,18 +505,156 @@ class SSHTransport {
       plaintext[1 + data.length + i] = _secureRandom.nextInt(256);
     }
 
-    final encrypted = chacha.encrypt(
+    // Same pure function the crypto worker runs; _localChaCha was built from
+    // _localCipherKey (1121), so this is byte-identical.
+    socket.sink.add(encryptChaChaPacket(
+      _localCipherKey!,
+      _localPacketSN.value,
       plaintext,
       packetLength,
-      _localPacketSN.value,
-    );
-
-    socket.sink.add(encrypted);
+    ));
   }
 
   int _alignedPaddingLength(int payloadLength, int align) {
     final paddingLength = align - ((payloadLength + 1) % align);
     return paddingLength < 4 ? paddingLength + align : paddingLength;
+  }
+
+  // ── Send-crypto offload internals ──────────────────────────────────
+
+  /// Builds the plaintext (padLen || data || random padding) once, on the main
+  /// isolate, so the RNG stays on one isolate and the worker is a pure function
+  /// of (key, seq, plaintext).
+  (Uint8List, int) _buildSendPlaintext(Uint8List data, int blockSize) {
+    final paddingLength = _alignedPaddingLength(data.length, blockSize);
+    final packetLength = 1 + data.length + paddingLength;
+    final plaintext = Uint8List(packetLength)
+      ..[0] = paddingLength
+      ..setRange(1, 1 + data.length, data);
+    for (var i = 0; i < paddingLength; i++) {
+      plaintext[1 + data.length + i] = _secureRandom.nextInt(256);
+    }
+    return (plaintext, packetLength);
+  }
+
+  void _enqueueSendOffload(Uint8List data, SSHCipherType cipherType,
+      {required bool gcm}) {
+    final (plaintext, packetLength) =
+        _buildSendPlaintext(data, cipherType.blockSize);
+    final aad = gcm
+        ? (Uint8List(4)..buffer.asByteData().setUint32(0, packetLength))
+        : null;
+    final jobId = _nextSendJobId++;
+    // In-flight jobs are bounded in practice by the SSH channel remote window
+    // (the upload loop pauses at _remoteWindow <= 0) plus the SFTP 1MB write
+    // window, so the worker queue cannot grow without limit under normal flow
+    // control. Log if it ever climbs unusually high (a very large/tuned window
+    // or many concurrent channels) so memory pressure is observable; the queue
+    // still drains strictly FIFO.
+    final inFlight = jobId - _nextExpectedWriteJobId;
+    if (inFlight == 512) {
+      printDebug?.call('SSHTransport: send-crypto in-flight high ($inFlight)');
+    }
+    _sendWorker!.encrypt(
+      jobId: jobId,
+      epoch: _sendEpoch,
+      seq: _localPacketSN.value,
+      packetLength: packetLength,
+      plaintext: plaintext,
+      aad: aad,
+    );
+  }
+
+  /// Number of send-crypto jobs submitted to the worker but not yet written to
+  /// the socket. Bounded by SSH channel flow control; exposed for observability.
+  int get sendInFlight => _nextSendJobId - _nextExpectedWriteJobId;
+
+  /// The deferred socket write. The ONLY difference from the inline path is that
+  /// the `socket.sink.add` moves here, into the ordered reply callback. Replies
+  /// arrive in submit order (single FIFO port + single-threaded worker), so
+  /// writes stay in sequence order; the guard converts any violation into a
+  /// clean disconnect rather than silent channel corruption.
+  void _onSendWorkerDone(int jobId, Uint8List ciphertext) {
+    if (jobId != _nextExpectedWriteJobId) {
+      closeWithError(SSHStateError(
+          'send crypto out of order: got job $jobId, expected '
+          '$_nextExpectedWriteJobId'));
+      return;
+    }
+    _nextExpectedWriteJobId++;
+    if (isClosed) return; // socket destroyed mid-flight: drop
+    socket.sink.add(ciphertext);
+  }
+
+  void _onSendWorkerError(String message) {
+    // Never re-encrypt inline: a retried packet under an already-consumed seq
+    // is nonce reuse. Any worker fault tears the connection down cleanly.
+    closeWithError(SSHStateError('send crypto worker: $message'));
+  }
+
+  /// Installs an offloadable (ChaCha/GCM) key generation on the worker, spawning
+  /// it lazily on first use. Sent in-band on the same FIFO port as encrypt jobs,
+  /// so the key swap lands strictly after the NEWKEYS packet of the outgoing
+  /// epoch (which was enqueued just before this call).
+  void _installSendCipherOffload(String mode, Uint8List key, Uint8List iv) {
+    _sendEpoch++;
+    final install = (
+      epoch: _sendEpoch,
+      mode: mode,
+      key: Uint8List.fromList(key), // COPY, never a view main zeroes on rekey
+      iv: Uint8List.fromList(iv),
+    );
+    final worker = _sendWorker;
+    if (worker != null) {
+      worker.installKey(
+          epoch: install.epoch,
+          mode: install.mode,
+          key: install.key,
+          iv: install.iv);
+      // send() deep-copied synchronously, so scrub our copy now: without this
+      // the send key would linger un-zeroed on the main heap, defeating the
+      // rekey scrub of _localCipherKey.
+      _zeroSendInstall(install);
+      return;
+    }
+    // Not spawned yet: hold the latest key to install on ready, scrubbing any
+    // pending copy this one supersedes.
+    if (_pendingSendInstall != null) _zeroSendInstall(_pendingSendInstall!);
+    _pendingSendInstall = install;
+    if (_spawningSendWorker) return; // spawn already in flight; installs latest
+    _spawningSendWorker = true;
+    SendCryptoWorker.spawn(
+      onDone: _onSendWorkerDone,
+      onError: _onSendWorkerError,
+    ).then((w) {
+      _spawningSendWorker = false;
+      final p = _pendingSendInstall;
+      _pendingSendInstall = null;
+      if (isClosed) {
+        if (p != null) _zeroSendInstall(p);
+        w.dispose();
+        return;
+      }
+      _sendWorker = w;
+      if (p != null) {
+        w.installKey(epoch: p.epoch, mode: p.mode, key: p.key, iv: p.iv);
+        _zeroSendInstall(p);
+      }
+    }).catchError((Object e) {
+      // Spawn failed: stay on the inline path (always correct).
+      _spawningSendWorker = false;
+      final p = _pendingSendInstall;
+      _pendingSendInstall = null;
+      if (p != null) _zeroSendInstall(p);
+      printDebug?.call(
+          'SSHTransport: send crypto worker spawn failed, inline path: $e');
+    });
+  }
+
+  void _zeroSendInstall(
+      ({int epoch, String mode, Uint8List key, Uint8List iv}) install) {
+    zeroBytes(install.key);
+    zeroBytes(install.iv);
   }
 
   Uint8List _processAead({
@@ -513,21 +674,20 @@ class SSHTransport {
     return cipher.process(input);
   }
 
-  Uint8List _nonceForSequence(Uint8List iv, int sequence) {
-    if (iv.length != 12) {
-      throw ArgumentError.value(iv, 'iv', 'AEAD IV must be 12 bytes long');
-    }
-
-    final nonce = Uint8List.fromList(iv);
-    final view = ByteData.sublistView(nonce);
-    final counter = view.getUint64(4);
-    view.setUint64(4, counter + sequence);
-    return nonce;
-  }
+  // Delegates to the shared pure helper so send (worker) and receive share one
+  // nonce derivation and cannot drift.
+  Uint8List _nonceForSequence(Uint8List iv, int sequence) =>
+      sshAeadNonceForSequence(iv, sequence);
 
   void close() {
     printDebug?.call('SSHTransport.close');
     if (isClosed) return;
+    _sendWorker?.dispose();
+    _sendWorker = null;
+    if (_pendingSendInstall != null) {
+      _zeroSendInstall(_pendingSendInstall!);
+      _pendingSendInstall = null;
+    }
     _socketSubscription?.cancel();
     _socketSubscription = null;
     _doneCompleter.complete();
@@ -537,6 +697,12 @@ class SSHTransport {
   void closeWithError(SSHError error, [StackTrace? stackTrace]) {
     printDebug?.call('SSHTransport.closeWithError $error');
     if (isClosed) return;
+    _sendWorker?.dispose();
+    _sendWorker = null;
+    if (_pendingSendInstall != null) {
+      _zeroSendInstall(_pendingSendInstall!);
+      _pendingSendInstall = null;
+    }
     _socketSubscription?.cancel();
     _socketSubscription = null;
     _doneCompleter.completeError(error, stackTrace ?? StackTrace.current);
@@ -1121,6 +1287,9 @@ class SSHTransport {
       _localChaCha = SSHCipherChaCha20Poly1305(key: _localCipherKey!);
       _encryptCipher = null;
       _localMac = null;
+      if (offloadSendCrypto) {
+        _installSendCipherOffload('chacha', _localCipherKey!, _localIV!);
+      }
       return;
     }
 
@@ -1135,6 +1304,9 @@ class SSHTransport {
     if (cipherType.isAead) {
       _encryptCipher = null;
       _localMac = null;
+      if (offloadSendCrypto) {
+        _installSendCipherOffload('gcm', _localCipherKey!, _localIV!);
+      }
       return;
     }
 

@@ -56,6 +56,12 @@ const _initialWindowSize = 1024 * 1024 * 2;
 
 const _maximumPacketSize = 32768;
 
+/// Floor applied to the maximum packet size a peer ADVERTISES for a channel.
+/// A value of 0 (hostile or broken server) would otherwise make the upload
+/// loop spin forever sending empty CHANNEL_DATA, and a tiny value amplifies
+/// per-byte overhead; a compliant server never advertises less than this.
+const _minRemoteMaximumPacketSize = 1024;
+
 class SSHPtyConfig {
   /// Type of terminal, for example 'xterm', 'xterm-256color'.
   final String type;
@@ -192,6 +198,11 @@ class SSHClient {
   /// Allow to disable hostkey verification, which can be slow in debug mode.
   final bool disableHostkeyVerification;
 
+  /// When true, ChaCha20-Poly1305 / AES-GCM send-side encryption runs on a
+  /// background worker isolate so bulk SFTP uploads do not block the UI. Purely
+  /// an optimization (inline path is always correct); default false.
+  final bool offloadSendCrypto;
+
   /// Identification string advertised during the SSH version exchange (the part
   /// after `SSH-2.0-`). Defaults to [kDefaultClientIdent]
   /// (`'zest_ssh_core_<version>'`).
@@ -228,6 +239,7 @@ class SSHClient {
     this.agentHandler,
     this.keepAliveInterval = const Duration(seconds: 10),
     this.disableHostkeyVerification = false,
+    this.offloadSendCrypto = false,
     String ident = kDefaultClientIdent,
   }) : ident = _validateIdent(ident) {
     _diagnostics = SSHConnectionDiagnostics();
@@ -248,6 +260,7 @@ class SSHClient {
       onKexCompleted: _handleKexCompleted,
       onHostKeyReceived: _handleHostKeyReceived,
       disableHostkeyVerification: disableHostkeyVerification,
+      offloadSendCrypto: offloadSendCrypto,
       version: ident,
     );
 
@@ -734,7 +747,14 @@ class SSHClient {
   /// Close all channels that are currently open.
   void _closeChannels() {
     for (final channel in _channels.values) {
-      channel.destroy();
+      // One channel failing to tear down (e.g. a send on an already-dead
+      // transport) must not abort this loop and leave the remaining channels
+      // undestroyed with leaked done futures, or skip _channels.clear().
+      try {
+        channel.destroy();
+      } catch (e) {
+        printDebug?.call('SSHClient._closeChannels - destroy error: $e');
+      }
       _channelIdAllocator.release(channel.localId);
     }
 
@@ -1548,7 +1568,10 @@ class SSHClient {
       localMaximumPacketSize: _maximumPacketSize,
       remoteId: remoteChannelId,
       remoteInitialWindowSize: remoteInitialWindowSize,
-      remoteMaximumPacketSize: remoteMaximumPacketSize,
+      remoteMaximumPacketSize:
+          remoteMaximumPacketSize < _minRemoteMaximumPacketSize
+              ? _minRemoteMaximumPacketSize
+              : remoteMaximumPacketSize,
       sendMessage: _sendMessage,
       printDebug: printDebug,
     );

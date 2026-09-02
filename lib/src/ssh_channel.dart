@@ -328,7 +328,16 @@ class SSHChannelController {
     if (_done.isCompleted) return;
     if (_hasSentEOF) return;
     _hasSentEOF = true;
-    sendMessage(SSH_Message_Channel_EOF(recipientChannel: remoteId));
+    // The transport may already be dead: an unexpected disconnect tears the
+    // channels down after the transport's done future completes, so the
+    // send can throw SSHStateError. Swallow it exactly as _sendCloseIfNeeded
+    // does, so destroy() always reaches _done.complete() and one dead-transport
+    // drop cannot leave channels 2..N undestroyed with leaked done futures.
+    try {
+      sendMessage(SSH_Message_Channel_EOF(recipientChannel: remoteId));
+    } catch (e) {
+      printDebug?.call('SSHChannelController._sendEOFIfNeeded - error: $e');
+    }
   }
 
   void _sendCloseIfNeeded() {
@@ -373,12 +382,22 @@ class SSHChannelController {
   }
 
   late final _uploadLoop = OnceSimultaneously(() async {
+    var sentSinceYield = 0;
     while (true) {
       if (_remoteWindow <= 0) {
         return;
       }
 
       final dataToRead = min(_remoteWindow, remoteMaximumPacketSize);
+      if (dataToRead <= 0) {
+        // A remote maximum packet size of 0 would make read(0) return an
+        // empty view WITHOUT consuming anything, so this loop would spin
+        // forever emitting empty CHANNEL_DATA (a hostile or broken server can
+        // advertise 0). The acceptance floor in SSHClient makes this
+        // unreachable; exit rather than continue, since continue would
+        // re-spin on the unconsumed chunk.
+        return;
+      }
       final data = await _locaStreamConsumer.read(dataToRead);
 
       if (data == null) {
@@ -410,6 +429,16 @@ class SSHChannelController {
       sendMessage(message);
 
       _remoteWindow -= data.bytes.length;
+
+      // Cooperative macrotask yield during a sustained upload burst so the
+      // platform message pump (paint, input, window-restore) gets a slice.
+      // Mirrors the receive-side yield (ssh_transport.dart `_packetsPerYield`):
+      // the buffered read above only schedules a microtask, which the platform
+      // pump does not run between, so yield explicitly with `Duration.zero`.
+      if (++sentSinceYield >= 8) {
+        sentSinceYield = 0;
+        await Future<void>.delayed(Duration.zero);
+      }
     }
   });
 }
