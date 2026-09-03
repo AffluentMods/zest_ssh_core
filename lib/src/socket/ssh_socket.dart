@@ -24,6 +24,21 @@ abstract class SSHSocket {
   /// A future that will complete when the consumer closes, or when an error occurs.
   Future<void> get done;
 
+  /// Completes once every byte previously added to [sink] has been accepted
+  /// by the underlying platform (for a TCP socket: handed to the OS send
+  /// buffer). Bulk senders use it as backpressure so a slow link does not pile
+  /// megabytes of queued packets ahead of interactive traffic on the same
+  /// connection. Implementations without a meaningful buffer complete at once.
+  ///
+  /// Callers must not `add` to [sink] while a flush is in progress (dart:io
+  /// throws for that); [SSHTransport] serialises its writes around it.
+  ///
+  /// Defaults to a no-op so an implementation with no platform send buffer,
+  /// and any external implementer of this public interface, keeps compiling
+  /// and simply offers no send-backpressure signal. This is a concrete method,
+  /// not an abstract one, so adding it did not break `implements SSHSocket`.
+  Future<void> flush() async {}
+
   /// Closes the socket, returning the same future as [done].
   Future<void> close();
 

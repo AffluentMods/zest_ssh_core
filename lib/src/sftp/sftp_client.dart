@@ -488,9 +488,24 @@ class SftpClient {
     }
   }
 
+  /// Max SFTP replies dispatched per event-loop turn. The transport's own
+  /// yield governs only DECRYPT; decrypted payloads reach this client through
+  /// the channel stream, and a single CHANNEL_DATA can carry many tiny replies
+  /// (a server coalescing the acks of a many-small-files upload). Dispatching
+  /// them all in one synchronous loop also completes every awaiting per-file
+  /// continuation as one uninterruptible run. Bound the batch and continue on a
+  /// MACROTASK so the platform pump (paint, input) gets a slice in between.
+  static const int _repliesPerTurn = 32;
+  bool _drainScheduled = false;
+
   void _handlePackets() {
     const lengthHeader = 4; // 4 bytes packet length header
+    var dispatched = 0;
     while (_buffer.length >= lengthHeader) {
+      if (dispatched >= _repliesPerTurn) {
+        _scheduleDrain();
+        return;
+      }
       final length = _buffer.byteData.getUint32(0);
       if (length > _kMaxPacketLength) {
         throw SftpError(
@@ -500,7 +515,25 @@ class SftpClient {
       final packet = _buffer.consume(lengthHeader + length);
       final payload = Uint8List.sublistView(packet, lengthHeader);
       _handlePacket(payload);
+      dispatched++;
     }
+  }
+
+  /// Continue draining [_buffer] on the next macrotask (at most one pending).
+  /// Mirrors the stream listener's error handling so a malformed reply in the
+  /// deferred batch tears the client down the same way an immediate one does.
+  void _scheduleDrain() {
+    if (_drainScheduled) return;
+    _drainScheduled = true;
+    Future<void>.delayed(Duration.zero, () {
+      _drainScheduled = false;
+      try {
+        _handlePackets();
+      } catch (e, st) {
+        _closeError(e, st);
+        _channel.close().catchError((_) {});
+      }
+    });
   }
 
   void _handlePacket(Uint8List payload) {

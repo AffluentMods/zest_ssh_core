@@ -198,6 +198,9 @@ class _SessionHarness {
 }
 
 class _FakeSSHSocket implements SSHSocket {
+  @override
+  Future<void> flush() async {}
+
   final _inputController = StreamController<Uint8List>();
   final _doneCompleter = Completer<void>();
 

@@ -29,6 +29,17 @@ class SSHChannelController {
 
   final void Function(SSHMessage) sendMessage;
 
+  /// Backpressure hook for bulk sends: completes once everything written to
+  /// the transport so far has been accepted by the OS (see
+  /// `SSHTransport.drainSocket`). Null (tests, exotic transports) = no-op.
+  final Future<void> Function()? drainSocket;
+
+  /// Bytes of channel data queued between two drains. Bounds the Dart-side
+  /// socket backlog, and with it the latency any other channel's packet sees
+  /// on a slow link (128 KB is ~75 ms on a 14 Mbps uplink). Small enough to
+  /// matter, large enough that the per-drain overhead is noise.
+  static const int _drainAfterBytes = 128 * 1024;
+
   SSHChannel get channel => SSHChannel(this);
 
   SSHChannelController({
@@ -39,6 +50,7 @@ class SSHChannelController {
     required this.remoteInitialWindowSize,
     required this.remoteMaximumPacketSize,
     required this.sendMessage,
+    this.drainSocket,
     this.printDebug,
   }) {
     if (remoteInitialWindowSize > 0) {
@@ -251,7 +263,6 @@ class SSHChannelController {
   }
 
   void _handleWindowAdjustMessage(int bytesToAdd) {
-    printDebug?.call('SSHChannel._handleWindowAdjustMessage: $bytesToAdd');
 
     if (bytesToAdd < 0) {
       throw ArgumentError.value(bytesToAdd, 'bytesToAdd', 'must be positive');
@@ -265,7 +276,6 @@ class SSHChannelController {
   }
 
   void _handleDataMessage(Uint8List data, {int? type}) {
-    printDebug?.call('SSHChannel._handleDataMessage: len=${data.length}');
 
     if (_remoteStream.isClosed) {
       printDebug?.call('SSHChannel._handleDataMessage: remote already closed');
@@ -364,7 +374,6 @@ class SSHChannelController {
   }
 
   void _sendWindowAdjustIfNeeded() {
-    printDebug?.call('SSHChannel._sendWindowAdjustIfNeeded');
 
     if (_done.isCompleted) return;
     if (_remoteStream.isPaused) return;
@@ -383,6 +392,8 @@ class SSHChannelController {
 
   late final _uploadLoop = OnceSimultaneously(() async {
     var sentSinceYield = 0;
+    var sentBytesSinceYield = 0;
+    final sinceYield = Stopwatch()..start();
     while (true) {
       if (_remoteWindow <= 0) {
         return;
@@ -413,7 +424,6 @@ class SSHChannelController {
         return;
       }
 
-      printDebug?.call('SSHChannel._uploadLoop: len=${data.bytes.length}');
 
       final message = data.isExtendedData
           ? SSH_Message_Channel_Extended_Data(
@@ -429,14 +439,40 @@ class SSHChannelController {
       sendMessage(message);
 
       _remoteWindow -= data.bytes.length;
+      sentBytesSinceYield += data.bytes.length;
 
       // Cooperative macrotask yield during a sustained upload burst so the
       // platform message pump (paint, input, window-restore) gets a slice.
-      // Mirrors the receive-side yield (ssh_transport.dart `_packetsPerYield`):
-      // the buffered read above only schedules a microtask, which the platform
-      // pump does not run between, so yield explicitly with `Duration.zero`.
-      if (++sentSinceYield >= 8) {
+      // TIME-BUDGETED: yield after 8 packets OR once ~8ms has elapsed since the
+      // last yield, whichever comes first. The packet count alone is not enough
+      // when packets are large or the cipher is slow: 8 full 32KB packets can
+      // occupy the isolate well past a frame's 16ms budget, which is what makes
+      // a big upload visibly janky at low CPU. The elapsed-time cap guarantees
+      // control returns to the pump at least every ~8ms regardless of packet
+      // size. The buffered read above only schedules a microtask (which the pump
+      // does not run between), so yield explicitly with `Duration.zero`.
+      if (++sentSinceYield >= 8 ||
+          sentBytesSinceYield >= _drainAfterBytes ||
+          sinceYield.elapsedMilliseconds >= 8) {
         sentSinceYield = 0;
+        sentBytesSinceYield = 0;
+        sinceYield.reset();
+        // Bound the socket backlog BEFORE queueing more: wait until the OS has
+        // accepted what is already written. Without this a slow uplink lets
+        // the whole remote window (megabytes) pile up in the Dart-side socket
+        // queue, and every other channel's packet (a directory listing, a
+        // keystroke) waits behind it: seconds of interactive latency during
+        // an upload. The kernel's auto-tuned send buffer keeps the pipe full
+        // while we wait, so throughput does not drop.
+        final drain = drainSocket;
+        if (drain != null) {
+          try {
+            await drain();
+          } catch (_) {
+            // A dead socket surfaces through the transport's own error path;
+            // the loop must not die on the drain itself.
+          }
+        }
         await Future<void>.delayed(Duration.zero);
       }
     }

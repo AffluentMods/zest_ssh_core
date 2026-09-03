@@ -198,11 +198,6 @@ class SSHClient {
   /// Allow to disable hostkey verification, which can be slow in debug mode.
   final bool disableHostkeyVerification;
 
-  /// When true, ChaCha20-Poly1305 / AES-GCM send-side encryption runs on a
-  /// background worker isolate so bulk SFTP uploads do not block the UI. Purely
-  /// an optimization (inline path is always correct); default false.
-  final bool offloadSendCrypto;
-
   /// Identification string advertised during the SSH version exchange (the part
   /// after `SSH-2.0-`). Defaults to [kDefaultClientIdent]
   /// (`'zest_ssh_core_<version>'`).
@@ -239,7 +234,6 @@ class SSHClient {
     this.agentHandler,
     this.keepAliveInterval = const Duration(seconds: 10),
     this.disableHostkeyVerification = false,
-    this.offloadSendCrypto = false,
     String ident = kDefaultClientIdent,
   }) : ident = _validateIdent(ident) {
     _diagnostics = SSHConnectionDiagnostics();
@@ -260,7 +254,6 @@ class SSHClient {
       onKexCompleted: _handleKexCompleted,
       onHostKeyReceived: _handleHostKeyReceived,
       disableHostkeyVerification: disableHostkeyVerification,
-      offloadSendCrypto: offloadSendCrypto,
       version: ident,
     );
 
@@ -1573,6 +1566,7 @@ class SSHClient {
               ? _minRemoteMaximumPacketSize
               : remoteMaximumPacketSize,
       sendMessage: _sendMessage,
+      drainSocket: _transport.drainSocket,
       printDebug: printDebug,
     );
 

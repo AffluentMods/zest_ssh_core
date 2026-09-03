@@ -62,6 +62,12 @@ class SSHForwardChannel implements SSHSocket {
   @override
   StreamSink<List<int>> get sink => _sinkController.sink;
 
+  /// A forwarded channel has no platform send buffer of its own (the outer
+  /// connection's transport does the buffering), so there is nothing to wait
+  /// for here.
+  @override
+  Future<void> flush() async {}
+
   /// Close our end of the channel. Returns a future that waits for the
   /// other side to close.
   @override

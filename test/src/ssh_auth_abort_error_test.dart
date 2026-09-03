@@ -47,6 +47,9 @@ void main() {
 }
 
 class _FakeSSHSocket implements SSHSocket {
+  @override
+  Future<void> flush() async {}
+
   final _inputController = StreamController<Uint8List>();
   final _doneCompleter = Completer<void>();
   final _sink = _RecordingSink();

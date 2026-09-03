@@ -1,11 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math' show Random, max;
+import 'dart:math' show max;
 import 'dart:typed_data';
 
 import 'package:zest_ssh_core/src/algorithm/ssh_cipher_chacha20_poly1305.dart';
 import 'package:zest_ssh_core/src/algorithm/ssh_send_crypto.dart';
-import 'package:zest_ssh_core/src/send_crypto_worker.dart';
 import 'package:zest_ssh_core/src/hostkey/hostkey_ecdsa.dart';
 import 'package:zest_ssh_core/src/hostkey/hostkey_rsa.dart';
 import 'package:zest_ssh_core/src/kex/kex_dh.dart';
@@ -29,6 +28,7 @@ import 'package:zest_ssh_core/src/message/msg_kex_dh.dart';
 import 'package:zest_ssh_core/src/message/msg_kex_ecdh.dart';
 import 'package:zest_ssh_core/src/ssh_message.dart';
 import 'package:pointycastle/export.dart';
+import 'package:pointycastle/random/fortuna_random.dart';
 
 import 'package:zest_ssh_core/src/utils/secure_memory.dart';
 
@@ -147,18 +147,10 @@ class SSHTransport {
     this.onKexCompleted,
     this.onHostKeyReceived,
     this.disableHostkeyVerification = false,
-    this.offloadSendCrypto = false,
   }) {
     _initSocket();
     _startHandshake();
   }
-
-  /// When true, ChaCha20-Poly1305 and AES-GCM send-side packet encryption runs
-  /// on a background worker isolate instead of the main isolate, so bulk SFTP
-  /// uploads no longer block the UI. Purely an optimization: the inline path is
-  /// always correct, and a spawn failure silently falls back to it. Default
-  /// false so existing behavior and the library's own tests are unchanged.
-  final bool offloadSendCrypto;
 
   final _doneCompleter = Completer<void>();
 
@@ -281,22 +273,74 @@ class SSHTransport {
   int? _lastRemoteChaChaSeq;
 
   /// Cryptographically secure RNG used for padding bytes.
-  final Random _secureRandom = Random.secure();
+  /// Packet-padding generator.
+  ///
+  /// SSH padding SHOULD be random (RFC 4253 §6), but it sits inside the
+  /// AEAD/MAC envelope, so what matters is a cryptographically strong STREAM,
+  /// not a kernel round-trip per byte. `Random.secure()` reaches the OS CSPRNG
+  /// on EVERY `nextInt` call; the previous per-byte padding loop therefore cost
+  /// one syscall per padding byte, on the main isolate, for every packet sent.
+  // ---- socket write path + bulk-send drain ---------------------------------
+
+  /// True while [drainSocket] is waiting on the socket. Writes that arrive in
+  /// that window are parked in [_deferredWrites] instead of hitting the sink:
+  /// dart:io's IOSink throws "StreamSink is bound to a stream" for an add()
+  /// during flush(), and this one transport is shared by every channel.
+  bool _draining = false;
+  Future<void>? _drainFuture;
+  final List<List<int>> _deferredWrites = [];
+
+  /// The ONLY path to the socket sink. Preserves write order across a drain.
+  void _writeToSocket(List<int> bytes) {
+    if (_draining) {
+      _deferredWrites.add(bytes);
+      return;
+    }
+    socket.sink.add(bytes);
+  }
+
+  /// Wait until everything handed to the socket so far has been accepted by
+  /// the OS. Bulk senders (the channel upload loop) await this periodically so
+  /// a slow uplink does not pile megabytes of ciphertext into the Dart-side
+  /// socket queue. Every channel shares this one TCP stream, so an interactive
+  /// request issued during an upload (a directory listing, a keystroke) would
+  /// otherwise sit behind the whole SSH window of already-queued data: seconds
+  /// on a residential uplink. The kernel's own auto-tuned (~bandwidth-delay
+  /// product) send buffer keeps the pipe full in the meantime, so throughput
+  /// is unaffected. Packets written while the drain is in flight keep their
+  /// order: they are queued and handed to the sink the moment it completes.
+  Future<void> drainSocket() {
+    final inFlight = _drainFuture;
+    if (inFlight != null) return inFlight;
+    Future<void> flushed;
+    try {
+      flushed = socket.flush();
+    } catch (_) {
+      return Future<void>.value();
+    }
+    _draining = true;
+    final future = flushed.catchError((Object _) {}).whenComplete(() {
+      _draining = false;
+      _drainFuture = null;
+      if (_deferredWrites.isEmpty) return;
+      final pending = List<List<int>>.of(_deferredWrites);
+      _deferredWrites.clear();
+      for (final bytes in pending) {
+        try {
+          socket.sink.add(bytes);
+        } catch (_) {
+          // The socket died mid-drain; the transport's done/close path owns
+          // the teardown, and the writer will see the closed transport.
+          break;
+        }
+      }
+    });
+    _drainFuture = future;
+    return future;
+  }
 
   /// Packets queued during key exchange that will be sent after NEW_KEYS
   final List<Uint8List> _rekeyPendingPackets = [];
-
-  // ── Send-crypto offload (opt-in via offloadSendCrypto) ──────────────
-  // Worker isolate that encrypts ChaCha/GCM packets off the main isolate. Null
-  // until the first offloadable key install; stays null forever if a spawn
-  // fails (inline fallback). The sequence number stays owned here, on the main
-  // isolate, and is passed per packet, so a nonce can never desync.
-  SendCryptoWorker? _sendWorker;
-  bool _spawningSendWorker = false;
-  int _nextSendJobId = 0; // monotonic id, assigned in submit order
-  int _nextExpectedWriteJobId = 0; // ordering guard for the deferred write
-  int _sendEpoch = 0; // bumped each offloadable key install
-  ({int epoch, String mode, Uint8List key, Uint8List iv})? _pendingSendInstall;
 
   void sendPacket(Uint8List data) {
     if (isClosed) {
@@ -355,11 +399,7 @@ class SSHTransport {
 
     // ChaCha20-Poly1305 has its own packet framing with encrypted length
     if (_localChaCha != null && localCipherType != null && localCipherType.isChaCha) {
-      if (_sendWorker != null) {
-        _enqueueSendOffload(data, localCipherType, gcm: false);
-      } else {
-        _sendChaChaPacket(data, localCipherType);
-      }
+      _sendChaChaPacket(data, localCipherType);
       _localPacketSN.increase();
       return;
     }
@@ -368,11 +408,7 @@ class SSHTransport {
         localCipherType.isAead &&
         _localCipherKey != null &&
         _localIV != null) {
-      if (_sendWorker != null) {
-        _enqueueSendOffload(data, localCipherType, gcm: true);
-      } else {
-        _sendAeadPacket(data, localCipherType);
-      }
+      _sendAeadPacket(data, localCipherType);
       _localPacketSN.increase();
       return;
     }
@@ -410,10 +446,9 @@ class SSHTransport {
       payloadToEncrypt[0] = adjustedPaddingLength; // Set padding length
       payloadToEncrypt.setRange(1, 1 + data.length, data); // Copy data
 
-      // Add random padding using cryptographically secure RNG.
-      for (var i = 0; i < adjustedPaddingLength; i++) {
-        payloadToEncrypt[1 + data.length + i] = _secureRandom.nextInt(256);
-      }
+      // Random padding from the shared OS CSPRNG (batched, see randomBytes).
+      payloadToEncrypt.setRange(
+          1 + data.length, packetLength, randomBytes(adjustedPaddingLength));
 
       // Verify that the payload length is a multiple of the block size
       if (payloadToEncrypt.length % blockSize != 0) {
@@ -437,7 +472,7 @@ class SSHTransport {
       buffer.add(encryptedPayload);
       buffer.add(macBytes);
 
-      socket.sink.add(buffer.takeBytes());
+      _writeToSocket(buffer.takeBytes());
     } else {
       // For standard encryption or no encryption:
       // Use the original packet packing logic
@@ -448,7 +483,7 @@ class SSHTransport {
       final packet = SSHPacket.pack(data, align: packetAlign);
 
       if (_encryptCipher == null) {
-        socket.sink.add(packet);
+        _writeToSocket(packet);
       } else {
         final mac = _localMac!;
         final encryptedPacket = _encryptCipher!.processAll(packet);
@@ -461,7 +496,7 @@ class SSHTransport {
         mac.updateAll(packet);
         buffer.add(mac.finish());
 
-        socket.sink.add(buffer.takeBytes());
+        _writeToSocket(buffer.takeBytes());
       }
     }
 
@@ -477,14 +512,11 @@ class SSHTransport {
 
     final plaintext = Uint8List(packetLength)
       ..[0] = paddingLength
-      ..setRange(1, 1 + data.length, data);
-
-    for (var i = 0; i < paddingLength; i++) {
-      plaintext[1 + data.length + i] = _secureRandom.nextInt(256);
-    }
+      ..setRange(1, 1 + data.length, data)
+      ..setRange(1 + data.length, packetLength, randomBytes(paddingLength));
 
     // Same pure function the crypto worker runs (aad + GCM ciphertext + tag).
-    socket.sink.add(encryptGcmPacket(
+    _writeToSocket(encryptGcmPacket(
       _localCipherKey!,
       _localIV!,
       _localPacketSN.value,
@@ -499,15 +531,12 @@ class SSHTransport {
 
     final plaintext = Uint8List(packetLength)
       ..[0] = paddingLength
-      ..setRange(1, 1 + data.length, data);
-
-    for (var i = 0; i < paddingLength; i++) {
-      plaintext[1 + data.length + i] = _secureRandom.nextInt(256);
-    }
+      ..setRange(1, 1 + data.length, data)
+      ..setRange(1 + data.length, packetLength, randomBytes(paddingLength));
 
     // Same pure function the crypto worker runs; _localChaCha was built from
     // _localCipherKey (1121), so this is byte-identical.
-    socket.sink.add(encryptChaChaPacket(
+    _writeToSocket(encryptChaChaPacket(
       _localCipherKey!,
       _localPacketSN.value,
       plaintext,
@@ -518,143 +547,6 @@ class SSHTransport {
   int _alignedPaddingLength(int payloadLength, int align) {
     final paddingLength = align - ((payloadLength + 1) % align);
     return paddingLength < 4 ? paddingLength + align : paddingLength;
-  }
-
-  // ── Send-crypto offload internals ──────────────────────────────────
-
-  /// Builds the plaintext (padLen || data || random padding) once, on the main
-  /// isolate, so the RNG stays on one isolate and the worker is a pure function
-  /// of (key, seq, plaintext).
-  (Uint8List, int) _buildSendPlaintext(Uint8List data, int blockSize) {
-    final paddingLength = _alignedPaddingLength(data.length, blockSize);
-    final packetLength = 1 + data.length + paddingLength;
-    final plaintext = Uint8List(packetLength)
-      ..[0] = paddingLength
-      ..setRange(1, 1 + data.length, data);
-    for (var i = 0; i < paddingLength; i++) {
-      plaintext[1 + data.length + i] = _secureRandom.nextInt(256);
-    }
-    return (plaintext, packetLength);
-  }
-
-  void _enqueueSendOffload(Uint8List data, SSHCipherType cipherType,
-      {required bool gcm}) {
-    final (plaintext, packetLength) =
-        _buildSendPlaintext(data, cipherType.blockSize);
-    final aad = gcm
-        ? (Uint8List(4)..buffer.asByteData().setUint32(0, packetLength))
-        : null;
-    final jobId = _nextSendJobId++;
-    // In-flight jobs are bounded in practice by the SSH channel remote window
-    // (the upload loop pauses at _remoteWindow <= 0) plus the SFTP 1MB write
-    // window, so the worker queue cannot grow without limit under normal flow
-    // control. Log if it ever climbs unusually high (a very large/tuned window
-    // or many concurrent channels) so memory pressure is observable; the queue
-    // still drains strictly FIFO.
-    final inFlight = jobId - _nextExpectedWriteJobId;
-    if (inFlight == 512) {
-      printDebug?.call('SSHTransport: send-crypto in-flight high ($inFlight)');
-    }
-    _sendWorker!.encrypt(
-      jobId: jobId,
-      epoch: _sendEpoch,
-      seq: _localPacketSN.value,
-      packetLength: packetLength,
-      plaintext: plaintext,
-      aad: aad,
-    );
-  }
-
-  /// Number of send-crypto jobs submitted to the worker but not yet written to
-  /// the socket. Bounded by SSH channel flow control; exposed for observability.
-  int get sendInFlight => _nextSendJobId - _nextExpectedWriteJobId;
-
-  /// The deferred socket write. The ONLY difference from the inline path is that
-  /// the `socket.sink.add` moves here, into the ordered reply callback. Replies
-  /// arrive in submit order (single FIFO port + single-threaded worker), so
-  /// writes stay in sequence order; the guard converts any violation into a
-  /// clean disconnect rather than silent channel corruption.
-  void _onSendWorkerDone(int jobId, Uint8List ciphertext) {
-    if (jobId != _nextExpectedWriteJobId) {
-      closeWithError(SSHStateError(
-          'send crypto out of order: got job $jobId, expected '
-          '$_nextExpectedWriteJobId'));
-      return;
-    }
-    _nextExpectedWriteJobId++;
-    if (isClosed) return; // socket destroyed mid-flight: drop
-    socket.sink.add(ciphertext);
-  }
-
-  void _onSendWorkerError(String message) {
-    // Never re-encrypt inline: a retried packet under an already-consumed seq
-    // is nonce reuse. Any worker fault tears the connection down cleanly.
-    closeWithError(SSHStateError('send crypto worker: $message'));
-  }
-
-  /// Installs an offloadable (ChaCha/GCM) key generation on the worker, spawning
-  /// it lazily on first use. Sent in-band on the same FIFO port as encrypt jobs,
-  /// so the key swap lands strictly after the NEWKEYS packet of the outgoing
-  /// epoch (which was enqueued just before this call).
-  void _installSendCipherOffload(String mode, Uint8List key, Uint8List iv) {
-    _sendEpoch++;
-    final install = (
-      epoch: _sendEpoch,
-      mode: mode,
-      key: Uint8List.fromList(key), // COPY, never a view main zeroes on rekey
-      iv: Uint8List.fromList(iv),
-    );
-    final worker = _sendWorker;
-    if (worker != null) {
-      worker.installKey(
-          epoch: install.epoch,
-          mode: install.mode,
-          key: install.key,
-          iv: install.iv);
-      // send() deep-copied synchronously, so scrub our copy now: without this
-      // the send key would linger un-zeroed on the main heap, defeating the
-      // rekey scrub of _localCipherKey.
-      _zeroSendInstall(install);
-      return;
-    }
-    // Not spawned yet: hold the latest key to install on ready, scrubbing any
-    // pending copy this one supersedes.
-    if (_pendingSendInstall != null) _zeroSendInstall(_pendingSendInstall!);
-    _pendingSendInstall = install;
-    if (_spawningSendWorker) return; // spawn already in flight; installs latest
-    _spawningSendWorker = true;
-    SendCryptoWorker.spawn(
-      onDone: _onSendWorkerDone,
-      onError: _onSendWorkerError,
-    ).then((w) {
-      _spawningSendWorker = false;
-      final p = _pendingSendInstall;
-      _pendingSendInstall = null;
-      if (isClosed) {
-        if (p != null) _zeroSendInstall(p);
-        w.dispose();
-        return;
-      }
-      _sendWorker = w;
-      if (p != null) {
-        w.installKey(epoch: p.epoch, mode: p.mode, key: p.key, iv: p.iv);
-        _zeroSendInstall(p);
-      }
-    }).catchError((Object e) {
-      // Spawn failed: stay on the inline path (always correct).
-      _spawningSendWorker = false;
-      final p = _pendingSendInstall;
-      _pendingSendInstall = null;
-      if (p != null) _zeroSendInstall(p);
-      printDebug?.call(
-          'SSHTransport: send crypto worker spawn failed, inline path: $e');
-    });
-  }
-
-  void _zeroSendInstall(
-      ({int epoch, String mode, Uint8List key, Uint8List iv}) install) {
-    zeroBytes(install.key);
-    zeroBytes(install.iv);
   }
 
   Uint8List _processAead({
@@ -682,12 +574,6 @@ class SSHTransport {
   void close() {
     printDebug?.call('SSHTransport.close');
     if (isClosed) return;
-    _sendWorker?.dispose();
-    _sendWorker = null;
-    if (_pendingSendInstall != null) {
-      _zeroSendInstall(_pendingSendInstall!);
-      _pendingSendInstall = null;
-    }
     _socketSubscription?.cancel();
     _socketSubscription = null;
     _doneCompleter.complete();
@@ -697,12 +583,6 @@ class SSHTransport {
   void closeWithError(SSHError error, [StackTrace? stackTrace]) {
     printDebug?.call('SSHTransport.closeWithError $error');
     if (isClosed) return;
-    _sendWorker?.dispose();
-    _sendWorker = null;
-    if (_pendingSendInstall != null) {
-      _zeroSendInstall(_pendingSendInstall!);
-      _pendingSendInstall = null;
-    }
     _socketSubscription?.cancel();
     _socketSubscription = null;
     _doneCompleter.completeError(error, stackTrace ?? StackTrace.current);
@@ -788,7 +668,7 @@ class SSHTransport {
     // RFC compatibility: SSH-1.99 banners indicate SSH-2 support with SSH-1 fallback.
     if (!(versionString.startsWith('SSH-2.0-') ||
         versionString.startsWith('SSH-1.99-'))) {
-      socket.sink.add(latin1.encode('Protocol mismatch\r\n'));
+      _writeToSocket(latin1.encode('Protocol mismatch\r\n'));
       throw SSHHandshakeError('Invalid version: $versionString');
     }
 
@@ -847,8 +727,8 @@ class SSHTransport {
     _processingPackets = true;
 
     try {
-      printDebug?.call('SSHTransport._processPackets');
       var processedSinceYield = 0;
+      final sinceYield = Stopwatch()..start();
       while (_buffer.isNotEmpty && !isClosed) {
         final payload = _consumePacket();
         if (payload == null) {
@@ -865,13 +745,19 @@ class SSHTransport {
           _remotePacketSN.increase();
         }
 
-        // Cooperatively yield after every [_packetsPerYield] packets so a
-        // sustained burst can't starve the platform event loop. The loop
-        // condition re-reads [_buffer] after the await, so data that arrived
-        // during the yield is drained by this same loop (the reentrant call
-        // that appended it was a no-op).
-        if (++processedSinceYield >= _packetsPerYield) {
+        // Cooperatively yield after every [_packetsPerYield] packets OR once
+        // ~8ms has elapsed since the last yield, whichever comes first, so a
+        // sustained burst can't starve the platform event loop. The count
+        // alone is not enough when packets are large or the cipher is slow;
+        // the time cap guarantees control returns to the pump within a frame
+        // regardless of packet size (mirrors the send-side _uploadLoop). The
+        // loop condition re-reads [_buffer] after the await, so data that
+        // arrived during the yield is drained by this same loop (the reentrant
+        // call that appended it was a no-op).
+        if (++processedSinceYield >= _packetsPerYield ||
+            sinceYield.elapsedMilliseconds >= 8) {
           processedSinceYield = 0;
+          sinceYield.reset();
           await Future<void>.delayed(Duration.zero);
         }
       }
@@ -901,7 +787,6 @@ class SSHTransport {
   }
 
   Uint8List? _consumeClearTextPacket() {
-    printDebug?.call('SSHTransport._consumeClearTextPacket');
 
     if (_buffer.length < 4) {
       return null;
@@ -923,7 +808,6 @@ class SSHTransport {
   }
 
   Uint8List? _consumeEncryptedPacket() {
-    printDebug?.call('SSHTransport._consumeEncryptedPacket');
 
     final remoteCipherType = isClient ? _serverCipherType : _clientCipherType;
 
@@ -1260,7 +1144,7 @@ class SSHTransport {
   }
 
   void _startHandshake() {
-    socket.sink.add(latin1.encode('$_localVersion\r\n'));
+    _writeToSocket(latin1.encode('$_localVersion\r\n'));
 
     if (isClient) {
       _sendKexInit();
@@ -1287,9 +1171,6 @@ class SSHTransport {
       _localChaCha = SSHCipherChaCha20Poly1305(key: _localCipherKey!);
       _encryptCipher = null;
       _localMac = null;
-      if (offloadSendCrypto) {
-        _installSendCipherOffload('chacha', _localCipherKey!, _localIV!);
-      }
       return;
     }
 
@@ -1304,9 +1185,6 @@ class SSHTransport {
     if (cipherType.isAead) {
       _encryptCipher = null;
       _localMac = null;
-      if (offloadSendCrypto) {
-        _installSendCipherOffload('gcm', _localCipherKey!, _localIV!);
-      }
       return;
     }
 
@@ -1330,6 +1208,14 @@ class SSHTransport {
   void _applyRemoteKeys() {
     final cipherType = isClient ? _serverCipherType : _clientCipherType;
     if (cipherType == null) throw StateError('No cipher type selected');
+
+    // Rekey opens a fresh key epoch: under strict KEX the receive sequence
+    // number restarts at 0 under a brand-new key, so re-arm the ChaCha
+    // nonce-reuse monotonicity guard. Without this the guard would see the
+    // post-rekey seq drop from a high value back to 0 and falsely flag nonce
+    // reuse (it is NOT reuse: the key rotated). Kept atomic with the key
+    // rotation here.
+    _lastRemoteChaChaSeq = null;
 
     // Zero old key material before overwriting references (rekey safety).
     if (_remoteCipherKey != null) zeroBytes(_remoteCipherKey!);
@@ -1920,15 +1806,22 @@ class SSHTransport {
     _applyRemoteKeys();
 
     // Terrapin (CVE-2023-48795) strict KEX mitigation: reset the RECEIVE
-    // sequence number after receiving server's NEWKEYS. The SEND sequence
-    // number is reset separately in _sendNewKeys() after we send ours.
-    // Each direction resets independently per the strict KEX spec.
+    // sequence number after receiving the server's NEWKEYS. Per the strict KEX
+    // spec (OpenSSH PROTOCOL 1.9(b)) this reset happens on EVERY NEWKEYS "for
+    // the duration of the connection (i.e. not just the first)", confirmed in
+    // OpenSSH packet.c (the reset is gated only on NEWKEYS && kex_strict, never
+    // on the initial KEX). So it must NOT be gated on _isInitialKex: a
+    // mid-session rekey (OpenSSH RekeyLimit, ~1GB or 1h) re-zeroes both peers'
+    // counters, and the old _isInitialKex gate desynced our read counter and
+    // dropped the connection on the first rekey. The SEND side already resets
+    // unconditionally in _sendNewKeys(). Nonce-safe: keys rotate each epoch, so
+    // (key, seq) never repeats even though seq restarts at 0.
     //
     // We also set _skipNextRemoteSNIncrease because _processPackets()
     // increments _remotePacketSN AFTER this handler returns. Without
     // skipping that increment, the first encrypted packet would be
     // decrypted with nonce=1 instead of nonce=0.
-    if (_isInitialKex && _serverSupportsStrictKex) {
+    if (_serverSupportsStrictKex) {
       printDebug?.call('SSHTransport: strict KEX - resetting RECEIVE sequence number');
       _remotePacketSN.reset();
       _skipNextRemoteSNIncrease = true;

@@ -138,6 +138,9 @@ void main() {
 }
 
 class _FakeSocket implements SSHSocket {
+  @override
+  Future<void> flush() async {}
+
   _FakeSocket(List<String> chunks)
       : _chunks = chunks
             .map((chunk) => Uint8List.fromList(chunk.codeUnits))
