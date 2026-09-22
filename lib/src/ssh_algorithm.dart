@@ -45,7 +45,13 @@ class SSHAlgorithms {
 
   const SSHAlgorithms({
     this.kex = const [
+      // Post-quantum hybrid first: an OpenSSH 9.9+ server picks it, an
+      // older server simply does not list it and we fall through.
+      SSHKexType.mlkem768x25519,
+      SSHKexType.sntrup761x25519,
+      SSHKexType.sntrup761x25519OpenSSH,
       SSHKexType.x25519,
+      SSHKexType.x25519Iana,
       SSHKexType.nistp521,
       SSHKexType.nistp384,
       SSHKexType.nistp256,

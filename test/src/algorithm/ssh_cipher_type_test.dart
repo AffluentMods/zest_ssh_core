@@ -107,7 +107,11 @@ void main() {
         equals([
           // SHA-1 key exchanges (dh14Sha1, dhGexSha1, dh1Sha1) are dropped
           // from the secure defaults - opt-in only via a compatibility profile.
+          SSHKexType.mlkem768x25519,
+          SSHKexType.sntrup761x25519,
+          SSHKexType.sntrup761x25519OpenSSH,
           SSHKexType.x25519,
+          SSHKexType.x25519Iana,
           SSHKexType.nistp521,
           SSHKexType.nistp384,
           SSHKexType.nistp256,

@@ -40,7 +40,7 @@ abstract class SSHKexUtils {
     required Uint8List hostKey,
     required Uint8List clientPublicKey,
     required Uint8List serverPublicKey,
-    required BigInt sharedSecret,
+    required Uint8List sharedSecret,
   }) {
     final writer = SSHMessageWriter();
     writer.writeUtf8(clientVersion);
@@ -59,7 +59,9 @@ abstract class SSHKexUtils {
 
     writer.writeString(clientPublicKey);
     writer.writeString(serverPublicKey);
-    writer.writeMpint(sharedSecret);
+    // Already encoded: `mpint K` for the classic exchanges, `string K` for
+    // the hybrid post-quantum ones (see encodeSharedSecretMpint / String).
+    writer.writeBytes(sharedSecret);
 
     final message = writer.takeBytes();
     digest.update(message, 0, message.length);
@@ -68,10 +70,27 @@ abstract class SSHKexUtils {
     return result;
   }
 
-  /// Derive various keys from the exchange hash.
+  /// The wire encoding of a classic (DH / ECDH) shared secret: `mpint K`.
+  static Uint8List encodeSharedSecretMpint(BigInt k) {
+    final writer = SSHMessageWriter();
+    writer.writeMpint(k);
+    return writer.takeBytes();
+  }
+
+  /// The wire encoding of a hybrid post-quantum shared secret: `string K`
+  /// (the hash output), as OpenSSH's kex-sntrup761x25519 / mlkem768x25519
+  /// put it in the exchange hash and the key derivation.
+  static Uint8List encodeSharedSecretString(Uint8List k) {
+    final writer = SSHMessageWriter();
+    writer.writeString(k);
+    return writer.takeBytes();
+  }
+
+  /// Derive various keys from the exchange hash. [sharedSecret] is the
+  /// wire-encoded secret (see [encodeSharedSecretMpint]).
   static Uint8List deriveKey({
     required Digest digest,
-    required BigInt sharedSecret,
+    required Uint8List sharedSecret,
     required Uint8List exchangeHash,
     required SSHDeriveKeyType keyType,
     required Uint8List sessionId,
@@ -81,7 +100,7 @@ abstract class SSHKexUtils {
 
     while (result.length < keySize) {
       final writer = SSHMessageWriter();
-      writer.writeMpint(sharedSecret);
+      writer.writeBytes(sharedSecret);
       writer.writeBytes(exchangeHash);
       if (result.isEmpty) {
         writer.writeUint8(keyType.magicChar);

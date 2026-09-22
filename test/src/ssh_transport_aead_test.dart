@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:zest_ssh_core/dartssh2.dart';
 import 'package:zest_ssh_core/src/message/msg_kex.dart';
+import 'package:zest_ssh_core/src/ssh_kex_utils.dart';
 import 'package:zest_ssh_core/src/ssh_packet.dart';
 import 'package:test/test.dart';
 
@@ -200,7 +201,8 @@ void main() {
       final transport = SSHTransport(socket);
 
       setPrivate(transport, '_kexType', SSHKexType.x25519);
-      setPrivate(transport, '_sharedSecret', BigInt.from(1));
+      setPrivate(transport, '_sharedSecret',
+          SSHKexUtils.encodeSharedSecretMpint(BigInt.from(1)));
       setPrivate(transport, '_exchangeHash',
           Uint8List.fromList(List<int>.filled(32, 1)));
       setPrivate(
@@ -226,7 +228,8 @@ void main() {
       final transport = SSHTransport(socket);
 
       setPrivate(transport, '_kexType', SSHKexType.x25519);
-      setPrivate(transport, '_sharedSecret', BigInt.from(1));
+      setPrivate(transport, '_sharedSecret',
+          SSHKexUtils.encodeSharedSecretMpint(BigInt.from(1)));
       setPrivate(transport, '_exchangeHash',
           Uint8List.fromList(List<int>.filled(32, 3)));
       setPrivate(
@@ -252,7 +255,8 @@ void main() {
       final transport = SSHTransport(socket);
 
       setPrivate(transport, '_kexType', SSHKexType.x25519);
-      setPrivate(transport, '_sharedSecret', BigInt.from(5));
+      setPrivate(transport, '_sharedSecret',
+          SSHKexUtils.encodeSharedSecretMpint(BigInt.from(5)));
       setPrivate(transport, '_exchangeHash',
           Uint8List.fromList(List<int>.filled(32, 6)));
       setPrivate(
@@ -273,7 +277,8 @@ void main() {
       final transport = SSHTransport(socket);
 
       setPrivate(transport, '_kexType', SSHKexType.x25519);
-      setPrivate(transport, '_sharedSecret', BigInt.from(8));
+      setPrivate(transport, '_sharedSecret',
+          SSHKexUtils.encodeSharedSecretMpint(BigInt.from(8)));
       setPrivate(transport, '_exchangeHash',
           Uint8List.fromList(List<int>.filled(32, 9)));
       setPrivate(transport, '_sessionId',
@@ -371,7 +376,8 @@ void main() {
       final transport = SSHTransport(socket);
 
       setPrivate(transport, '_kexType', SSHKexType.x25519);
-      setPrivate(transport, '_sharedSecret', BigInt.from(11));
+      setPrivate(transport, '_sharedSecret',
+          SSHKexUtils.encodeSharedSecretMpint(BigInt.from(11)));
       setPrivate(transport, '_exchangeHash',
           Uint8List.fromList(List<int>.filled(32, 12)));
       setPrivate(transport, '_sessionId',
@@ -392,7 +398,8 @@ void main() {
       final transport = SSHTransport(socket);
 
       setPrivate(transport, '_kexType', SSHKexType.x25519);
-      setPrivate(transport, '_sharedSecret', BigInt.from(14));
+      setPrivate(transport, '_sharedSecret',
+          SSHKexUtils.encodeSharedSecretMpint(BigInt.from(14)));
       setPrivate(transport, '_exchangeHash',
           Uint8List.fromList(List<int>.filled(32, 15)));
       setPrivate(transport, '_sessionId',

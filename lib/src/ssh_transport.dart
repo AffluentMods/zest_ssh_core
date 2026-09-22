@@ -9,6 +9,8 @@ import 'package:zest_ssh_core/src/hostkey/hostkey_ecdsa.dart';
 import 'package:zest_ssh_core/src/hostkey/hostkey_rsa.dart';
 import 'package:zest_ssh_core/src/kex/kex_dh.dart';
 import 'package:zest_ssh_core/src/kex/kex_nist.dart';
+import 'package:zest_ssh_core/src/kex/kex_mlkem768x25519.dart';
+import 'package:zest_ssh_core/src/kex/kex_sntrup761x25519.dart';
 import 'package:zest_ssh_core/src/kex/kex_x25519.dart';
 import 'package:zest_ssh_core/src/message/msg_userauth.dart';
 import 'package:zest_ssh_core/src/ssh_algorithm.dart';
@@ -215,9 +217,10 @@ class SSHTransport {
   /// once. Null until the first key exchange completes.
   Uint8List? _verifiedHostKey;
 
-  /// Shared secret derived from the key exchange process. Kept to derive the
-  /// cipher IV, cipher key and MAC key.
-  BigInt? _sharedSecret;
+  /// Shared secret derived from the key exchange process, in its WIRE
+  /// encoding (`mpint` for classic exchanges, `string` for the hybrid
+  /// post-quantum ones). Kept to derive the cipher IV, cipher key and MAC key.
+  Uint8List? _sharedSecret;
 
   /// A [BlockCipher] to encrypt data sent to the other side.
   BlockCipher? _encryptCipher;
@@ -1056,10 +1059,27 @@ class SSHTransport {
     }
 
     final remoteCipherType = isClient ? _serverCipherType : _clientCipherType;
+
+    // Whether the peer's packets are ALREADY protected by an AEAD / ChaCha
+    // cipher, i.e. remote keys were applied after NEWKEYS. The same tests
+    // _consumeEncryptedPacket uses to pick its framing. A cipher that is
+    // merely negotiated (KEXINIT done, NEWKEYS not yet received) does not
+    // count: the KEX reply and NEWKEYS themselves still travel in the clear
+    // and follow the plain 5-byte-header alignment. Deciding by the
+    // negotiated type alone rejected valid cleartext replies whose payload
+    // length happened to make the two rules differ (an ECDH P-256 reply
+    // signed with an Ed25519 host key, for one).
+    final remoteAeadActive = remoteCipherType != null &&
+        ((remoteCipherType.isChaCha && _remoteChaCha != null) ||
+            (remoteCipherType.isAead &&
+                !remoteCipherType.isChaCha &&
+                _remoteCipherKey != null &&
+                _remoteIV != null));
+
     int expectedPacketAlign;
     if (_decryptCipher != null) {
       expectedPacketAlign = max(SSHPacket.minAlign, _decryptCipher!.blockSize);
-    } else if (remoteCipherType != null && remoteCipherType.isAead) {
+    } else if (remoteAeadActive) {
       expectedPacketAlign = max(SSHPacket.minAlign, remoteCipherType.blockSize);
     } else {
       expectedPacketAlign = SSHPacket.minAlign;
@@ -1067,8 +1087,7 @@ class SSHTransport {
 
     int minPaddingLength;
 
-    if (remoteCipherType != null &&
-        (remoteCipherType.isChaCha || remoteCipherType.isAead)) {
+    if (remoteAeadActive) {
       // Both ChaCha20-Poly1305 and AES-GCM exclude the 4-byte packet-length
       // field from block alignment: ChaCha encrypts it separately, and GCM
       // carries it as cleartext AAD (RFC 5647). Alignment is therefore over
@@ -1398,6 +1417,9 @@ class SSHTransport {
       message = SSH_Message_KexDH_Init(e: kex.e);
     } else if (kex is SSHKexECDH) {
       message = SSH_Message_KexECDH_Init(kex.publicKey);
+    } else if (kex is SSHKexHybrid) {
+      // Same message id as ECDH_INIT, carrying the KEM key || X25519 key.
+      message = SSH_Message_KexECDH_Init(kex.publicKey);
     } else {
       throw StateError('No key exchange algorithm negotiated');
     }
@@ -1617,7 +1639,15 @@ class SSHTransport {
     );
 
     switch (_kexType) {
+      case SSHKexType.mlkem768x25519:
+        _kex = SSHKexMlKem768X25519();
+        break;
+      case SSHKexType.sntrup761x25519:
+      case SSHKexType.sntrup761x25519OpenSSH:
+        _kex = SSHKexSntrup761X25519();
+        break;
       case SSHKexType.x25519:
+      case SSHKexType.x25519Iana:
         _kex = SSHKexX25519();
         break;
       case SSHKexType.nistp256:
@@ -1675,7 +1705,7 @@ class SSHTransport {
     late Uint8List hostSignature;
     late Uint8List serverKexKey;
     late Uint8List clientKexKey;
-    late BigInt sharedSecret;
+    late Uint8List sharedSecret;
 
     if (kex is SSHKexDH) {
       final message = kexType.isGroupExchange
@@ -1686,7 +1716,8 @@ class SSHTransport {
       hostSignature = message.signature;
       serverKexKey = encodeBigInt(message.f);
       clientKexKey = encodeBigInt(kex.e);
-      sharedSecret = kex.computeSecret(message.f);
+      sharedSecret =
+          SSHKexUtils.encodeSharedSecretMpint(kex.computeSecret(message.f));
     } else if (kex is SSHKexECDH) {
       final message = SSH_Message_KexECDH_Reply.decode(payload);
       printTrace?.call('<- $socket: $message');
@@ -1694,7 +1725,19 @@ class SSHTransport {
       hostSignature = message.signature;
       serverKexKey = message.ecdhPublicKey;
       clientKexKey = kex.publicKey;
-      sharedSecret = kex.computeSecret(message.ecdhPublicKey);
+      sharedSecret = SSHKexUtils.encodeSharedSecretMpint(
+          kex.computeSecret(message.ecdhPublicKey));
+    } else if (kex is SSHKexHybrid) {
+      // Hybrid post-quantum: the reply blob is KEM ciphertext || X25519
+      // key, the secret is a hash and travels as `string K`.
+      final message = SSH_Message_KexECDH_Reply.decode(payload);
+      printTrace?.call('<- $socket: $message');
+      hostkey = message.hostPublicKey;
+      hostSignature = message.signature;
+      serverKexKey = message.ecdhPublicKey;
+      clientKexKey = kex.publicKey;
+      sharedSecret = SSHKexUtils.encodeSharedSecretString(
+          kex.computeSharedSecret(message.ecdhPublicKey));
     } else {
       throw UnimplementedError('$kex');
     }

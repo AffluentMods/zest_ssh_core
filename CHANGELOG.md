@@ -3,6 +3,39 @@
 This is the changelog for `zest_ssh_core`. For the history of dartssh2 up to the fork point, see
 `CHANGELOG-dartssh2.md`.
 
+## 0.2.0 - 2026-09-22
+
+### Post-quantum key exchange
+
+- `mlkem768x25519-sha256` (OpenSSH 9.9+ default) and `sntrup761x25519-sha512` plus its
+  `@openssh.com` spelling (OpenSSH 9.0 to 9.8 default) are implemented and offered FIRST by
+  default. Both are hybrids: the post-quantum KEM secret and the X25519 secret are hashed together,
+  so a session is only as weak as the stronger of the two, and a recording of it cannot be
+  decrypted by a future quantum computer. An older server that lists neither simply falls through
+  to the classic exchanges.
+- ML-KEM-768 is a pure Dart implementation of FIPS 203, checked against the NIST ACVP vectors
+  (key generation, encapsulation, decapsulation including implicit rejection). Streamlined NTRU
+  Prime 761 is a port of the public-domain reference (supercop-20240808 compact kem.c, as vendored
+  by OpenSSH), keeping its data-independent control flow. Both verified end to end against an
+  OpenSSH 10.2 server.
+- `SSHKexType.isHybridPostQuantum` / `SSHKexType.isPostQuantumName` for callers that want to show
+  it.
+- `curve25519-sha256` (the RFC 8731 name) is now offered next to the `@libssh.org` one.
+
+### Fixed
+
+- Incoming-packet padding was validated with the AEAD alignment rule as soon as ChaCha20-Poly1305
+  or AES-GCM was NEGOTIATED, before NEWKEYS, so a cleartext KEX reply whose payload length made the
+  two rules differ was rejected with `Invalid padding length`. Seen with `ecdh-sha2-nistp256` and an
+  Ed25519 host key against OpenSSH 10.2. The rule now follows the cipher actually in force.
+
+### Changed
+
+- The shared secret is carried in its wire encoding (`mpint` for the classic exchanges, `string`
+  for the hybrids) through `SSHKexUtils.computeExchangeHash` and `deriveKey`; callers that used
+  those helpers directly pass the encoded bytes now (`encodeSharedSecretMpint` /
+  `encodeSharedSecretString`).
+
 ## 0.1.0 - 2026-08-19
 
 First public release of the fork. Forked from dartssh2 `2.14.0`.

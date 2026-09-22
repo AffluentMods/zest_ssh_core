@@ -28,7 +28,7 @@ Two profiles. The default is what every connection proposes. The compatibility p
 
 | Category | Default (proposed to every server) | Compatibility only (opt-in) |
 | --- | --- | --- |
-| Key exchange | `curve25519-sha256@libssh.org`, `ecdh-sha2-nistp521`, `ecdh-sha2-nistp384`, `ecdh-sha2-nistp256`, `diffie-hellman-group-exchange-sha256`, `diffie-hellman-group14-sha256` | `diffie-hellman-group14-sha1`, `diffie-hellman-group-exchange-sha1`, `diffie-hellman-group1-sha1` |
+| Key exchange | `mlkem768x25519-sha256`, `sntrup761x25519-sha512`, `sntrup761x25519-sha512@openssh.com`, `curve25519-sha256@libssh.org`, `curve25519-sha256`, `ecdh-sha2-nistp521`, `ecdh-sha2-nistp384`, `ecdh-sha2-nistp256`, `diffie-hellman-group-exchange-sha256`, `diffie-hellman-group14-sha256` | `diffie-hellman-group14-sha1`, `diffie-hellman-group-exchange-sha1`, `diffie-hellman-group1-sha1` |
 | Host keys | `ssh-ed25519`, `rsa-sha2-512`, `rsa-sha2-256`, `ecdsa-sha2-nistp521`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp256` | `ssh-rsa` (SHA-1) |
 | Ciphers | `chacha20-poly1305@openssh.com`, `aes256-ctr`, `aes128-ctr` | `aes256-cbc`, `aes192-cbc`, `aes128-cbc` |
 | MACs | `hmac-sha2-512-etm`, `hmac-sha2-256-etm`, `hmac-sha2-512`, `hmac-sha2-256`, `hmac-sha1`, `hmac-sha2-512-96`, `hmac-sha2-256-96` | `hmac-md5` |
