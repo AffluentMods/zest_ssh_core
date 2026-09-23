@@ -3,6 +3,18 @@
 This is the changelog for `zest_ssh_core`. For the history of dartssh2 up to the fork point, see
 `CHANGELOG-dartssh2.md`.
 
+## 0.2.1 - 2026-09-23
+
+### Agent forwarding
+
+- The forwarded agent signs asynchronously, so hardware-token and agent-backed keys (whose
+  synchronous `sign()` throws) can answer a forwarded request. A key that refuses (a declined touch,
+  a locked token, a local agent that went away) now returns a plain agent failure instead of an
+  error, so the requester can try its next key.
+- New `SSHWrappedKeyPair` interface for a key pair that presents other public material than the key
+  it signs with, such as an SSH certificate wrapping a private key. The agent unwraps it, so an RSA
+  sign request gets the hash it asked for (the server refuses any other).
+
 ## 0.2.0 - 2026-09-22
 
 ### Post-quantum key exchange

@@ -53,7 +53,7 @@ class SSHKeyPairAgent implements SSHAgentHandler {
     return writer.takeBytes();
   }
 
-  Uint8List _handleSignRequest(SSHMessageReader reader) {
+  Future<Uint8List> _handleSignRequest(SSHMessageReader reader) async {
     final keyBlob = reader.readString();
     final data = reader.readString();
     final flags = reader.readUint32();
@@ -63,19 +63,40 @@ class SSHKeyPairAgent implements SSHAgentHandler {
       return _failure();
     }
 
-    final signature = _sign(identity, data, flags);
+    final SSHSignature signature;
+    try {
+      signature = await _sign(identity, data, flags);
+    } catch (_) {
+      // A refused touch, a locked token or a local agent that went away:
+      // the requester gets a plain failure and can try its next key.
+      return _failure();
+    }
     final writer = SSHMessageWriter();
     writer.writeUint8(SSHAgentProtocol.signResponse);
     writer.writeString(signature.encode());
     return writer.takeBytes();
   }
 
-  SSHSignature _sign(SSHKeyPair identity, Uint8List data, int flags) {
-    if (identity is OpenSSHRsaKeyPair || identity is RsaPrivateKey) {
+  Future<SSHSignature> _sign(
+    SSHKeyPair identity,
+    Uint8List data,
+    int flags,
+  ) async {
+    // A certificate signs with the key inside it. Unwrap it so an RSA
+    // request gets the hash it asked for: the requester announces that
+    // hash to the server, which refuses any other.
+    final signer = switch (identity) {
+      SSHWrappedKeyPair(:final innerKey) => innerKey,
+      _ => identity,
+    };
+    if (signer is OpenSSHRsaKeyPair || signer is RsaPrivateKey) {
       final signatureType = _rsaSignatureTypeForFlags(flags);
-      return _signRsa(identity, data, signatureType);
+      return _signRsa(signer, data, signatureType);
     }
-    return identity.sign(data);
+    // Hardware-token and agent-backed keys can only sign asynchronously
+    // (their sign() throws), so forwarding them used to fail every time.
+    // Software keys answer through the same path.
+    return signer.signAsync(data);
   }
 
   String _rsaSignatureTypeForFlags(int flags) {

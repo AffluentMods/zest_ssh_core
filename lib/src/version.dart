@@ -1,7 +1,7 @@
 /// Version of this library. Keep in step with the `version:` field in
 /// pubspec.yaml - it is the source of the client identification string sent
 /// during the SSH version exchange.
-const String kZestSshCoreVersion = '0.2.0';
+const String kZestSshCoreVersion = '0.2.1';
 
 /// Default SSH client identification string (the part after `SSH-2.0-`).
 ///

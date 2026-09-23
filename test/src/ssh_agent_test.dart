@@ -5,6 +5,7 @@ import 'package:zest_ssh_core/dartssh2.dart';
 import 'package:zest_ssh_core/src/hostkey/hostkey_rsa.dart';
 import 'package:zest_ssh_core/src/message/msg_channel.dart';
 import 'package:zest_ssh_core/src/ssh_channel.dart';
+import 'package:zest_ssh_core/src/ssh_hostkey.dart';
 import 'package:zest_ssh_core/src/ssh_message.dart';
 import 'package:test/test.dart';
 
@@ -21,6 +22,72 @@ class _RecordingAgentHandler implements SSHAgentHandler {
     requests.add(request);
     return response;
   }
+}
+
+/// Like a hardware token or a key held by a local agent: it can only sign
+/// asynchronously, and [sign] throws.
+class _AsyncOnlyKey extends SSHKeyPair {
+  _AsyncOnlyKey(this._real, {this.refuse = false});
+
+  final SSHKeyPair _real;
+  final bool refuse;
+
+  @override
+  String get name => _real.name;
+
+  @override
+  String get type => _real.type;
+
+  @override
+  SSHHostKey toPublicKey() => _real.toPublicKey();
+
+  @override
+  SSHSignature sign(Uint8List data) =>
+      throw UnsupportedError('this key only signs asynchronously');
+
+  @override
+  Future<SSHSignature> signAsync(Uint8List data) async {
+    if (refuse) throw StateError('touch not confirmed');
+    return _real.sign(data);
+  }
+
+  @override
+  String toPem() => throw UnsupportedError('no PEM for a token key');
+}
+
+class _BlobHostKey implements SSHHostKey {
+  _BlobHostKey(this._blob);
+
+  final Uint8List _blob;
+
+  @override
+  Uint8List encode() => _blob;
+}
+
+/// Presents its own public blob (as a certificate does) and signs with an
+/// inner key.
+class _WrappedKey extends SSHKeyPair implements SSHWrappedKeyPair {
+  _WrappedKey(this.innerKey, this._blob);
+
+  @override
+  final SSHKeyPair innerKey;
+
+  final Uint8List _blob;
+
+  @override
+  String get name => 'wrapped';
+
+  @override
+  String get type => innerKey.type;
+
+  @override
+  SSHHostKey toPublicKey() => _BlobHostKey(_blob);
+
+  @override
+  SSHSignature sign(Uint8List data) => innerKey.sign(data);
+
+  @override
+  String toPem() => innerKey.toPem();
 }
 
 void main() {
@@ -289,5 +356,58 @@ void main() {
     expect(dataMessages, isEmpty);
 
     controller.destroy();
+  });
+
+  group('forwarding keys that are not plain software keys', () {
+    final ed25519 = SSHKeyPair.fromPem(fixture('ssh-ed25519/id_ed25519')).single;
+    final data = Uint8List.fromList('sign-me'.codeUnits);
+
+    test('a key that only signs asynchronously (hardware token) signs',
+        () async {
+      final token = _AsyncOnlyKey(ed25519);
+      final agent = SSHKeyPairAgent([token]);
+
+      final response =
+          await agent.handleRequest(buildSignRequest(token, data, 0));
+      final reader = SSHMessageReader(response);
+
+      expect(reader.readUint8(), SSHAgentProtocol.signResponse);
+      expect(reader.readString(), ed25519.sign(data).encode());
+    });
+
+    test('a refused signature is an agent failure, not an error', () async {
+      final token = _AsyncOnlyKey(ed25519, refuse: true);
+      final agent = SSHKeyPairAgent([token]);
+
+      final response =
+          await agent.handleRequest(buildSignRequest(token, data, 0));
+
+      expect(SSHMessageReader(response).readUint8(), SSHAgentProtocol.failure);
+    });
+
+    test('a wrapped RSA key (a certificate) gets the hash the request asks for',
+        () async {
+      final rsa = rsaIdentity();
+      final blob = Uint8List.fromList(
+          [...'cert:'.codeUnits, ...rsa.toPublicKey().encode()]);
+      final wrapped = _WrappedKey(rsa, blob);
+      final agent = SSHKeyPairAgent([wrapped]);
+
+      final identities = SSHMessageReader(
+          await agent.handleRequest(buildRequestIdentities()));
+      expect(identities.readUint8(), SSHAgentProtocol.identitiesAnswer);
+      expect(identities.readUint32(), 1);
+      expect(identities.readString(), blob);
+
+      for (final entry in {
+        SSHAgentProtocol.rsaSha2_512: SSHRsaSignatureType.sha512,
+        SSHAgentProtocol.rsaSha2_256: SSHRsaSignatureType.sha256,
+      }.entries) {
+        final reader = SSHMessageReader(await agent
+            .handleRequest(buildSignRequest(wrapped, data, entry.key)));
+        expect(reader.readUint8(), SSHAgentProtocol.signResponse);
+        expect(SSHRsaSignature.decode(reader.readString()).type, entry.value);
+      }
+    });
   });
 }

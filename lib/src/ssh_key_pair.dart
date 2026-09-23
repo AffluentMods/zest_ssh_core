@@ -19,6 +19,14 @@ import 'package:pinenacl/ed25519.dart' as ed25519;
 import 'package:pointycastle/export.dart';
 import 'package:sign_dart/sign_dart.dart' as sign_dart;
 
+/// A key pair that presents other public material than the key it signs
+/// with, such as an SSH certificate wrapping a private key. The forwarded
+/// agent unwraps it, so an RSA sign request gets the hash it asks for
+/// (the wrapper itself signs with the inner key's default).
+abstract class SSHWrappedKeyPair {
+  SSHKeyPair get innerKey;
+}
+
 abstract class SSHKeyPair {
   static List<SSHKeyPair> fromPem(String pemText, [String? passphrase]) {
     final pem = SSHPem.decode(pemText);
