@@ -45,6 +45,9 @@ class SSHEventVersionExchange extends SSHEvent {
 class SSHEventKexStarted extends SSHEvent {
   final String kexAlgorithm;
   final String cipher;
+
+  /// The MAC beside [cipher]. Empty where the cipher checks its packets by
+  /// itself (chacha20-poly1305, AES-GCM) and so has none.
   final String mac;
   final String hostKeyAlgorithm;
 

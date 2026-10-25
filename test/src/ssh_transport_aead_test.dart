@@ -48,7 +48,7 @@ void main() {
         ),
       );
 
-      setPrivate(sender, '_clientCipherType', SSHCipherType.aes128gcm);
+      setPrivate(sender, '_localCipherType', SSHCipherType.aes128gcm);
       setPrivate(sender, '_localCipherKey', key);
       setPrivate(sender, '_localIV', iv);
       setPrivate(sender, '_kexInProgress', false);
@@ -74,7 +74,7 @@ void main() {
       );
 
       setPrivate(receiver, '_remoteVersion', 'SSH-2.0-test');
-      setPrivate(receiver, '_serverCipherType', SSHCipherType.aes128gcm);
+      setPrivate(receiver, '_remoteCipherType', SSHCipherType.aes128gcm);
       setPrivate(receiver, '_remoteCipherKey', key);
       setPrivate(receiver, '_remoteIV', iv);
       setSequenceValue(receiver, '_remotePacketSN', 0);
@@ -95,7 +95,7 @@ void main() {
       receiver.close();
     });
 
-    test('reports AEAD authentication failure when packet is tampered',
+    test('a packet that was tampered with ends the connection as one that did not pass its check',
         () async {
       final key = Uint8List(16);
       final iv = Uint8List(12);
@@ -114,7 +114,7 @@ void main() {
         ),
       );
 
-      setPrivate(sender, '_clientCipherType', SSHCipherType.aes128gcm);
+      setPrivate(sender, '_localCipherType', SSHCipherType.aes128gcm);
       setPrivate(sender, '_localCipherKey', key);
       setPrivate(sender, '_localIV', iv);
       setPrivate(sender, '_kexInProgress', false);
@@ -133,7 +133,7 @@ void main() {
       );
 
       setPrivate(receiver, '_remoteVersion', 'SSH-2.0-test');
-      setPrivate(receiver, '_serverCipherType', SSHCipherType.aes128gcm);
+      setPrivate(receiver, '_remoteCipherType', SSHCipherType.aes128gcm);
       setPrivate(receiver, '_remoteCipherKey', key);
       setPrivate(receiver, '_remoteIV', iv);
       setSequenceValue(receiver, '_remotePacketSN', 0);
@@ -146,7 +146,10 @@ void main() {
           predicate(
             (error) =>
                 error is SSHPacketError &&
-                error.toString().contains('AEAD authentication failed'),
+                error.damaged &&
+                error.message ==
+                    'A packet from the other side did not pass its check: it was changed or damaged on the '
+                        'way, or the two sides do not protect their packets the same way',
           ),
         ),
       );
@@ -175,7 +178,7 @@ void main() {
       final transport = SSHTransport(socket);
 
       setPrivate(transport, '_remoteVersion', 'SSH-2.0-test');
-      setPrivate(transport, '_serverCipherType', SSHCipherType.aes128gcm);
+      setPrivate(transport, '_remoteCipherType', SSHCipherType.aes128gcm);
       setPrivate(transport, '_remoteCipherKey', Uint8List(16));
       setPrivate(transport, '_remoteIV', Uint8List(12));
       setSequenceValue(transport, '_remotePacketSN', 0);
@@ -208,6 +211,10 @@ void main() {
       setPrivate(
           transport, '_sessionId', Uint8List.fromList(List<int>.filled(32, 2)));
       setPrivate(transport, '_clientCipherType', SSHCipherType.aes128gcm);
+      // A proposal names a MAC beside such a cipher too; it is not used.
+      setPrivate(transport, '_clientMacType', SSHMacType.hmacSha256);
+      expect(getPrivate<Object?>(transport, '_localCipherType'), isNull,
+          reason: 'agreed on, and not in force before its keys are');
 
       reflect(transport).invoke(privateSymbol('_applyLocalKeys'), const []);
 
@@ -219,6 +226,11 @@ void main() {
       expect(localIv!.length, SSHCipherType.aes128gcm.ivSize);
       expect(getPrivate<Object?>(transport, '_encryptCipher'), isNull);
       expect(getPrivate<Object?>(transport, '_localMac'), isNull);
+      // In force for what goes out, with its keys, and for nothing else.
+      expect(getPrivate<Object?>(transport, '_localCipherType'),
+          SSHCipherType.aes128gcm);
+      expect(getPrivate<Object?>(transport, '_localMacType'), isNull);
+      expect(getPrivate<Object?>(transport, '_remoteCipherType'), isNull);
 
       transport.close();
     });
@@ -235,6 +247,10 @@ void main() {
       setPrivate(
           transport, '_sessionId', Uint8List.fromList(List<int>.filled(32, 4)));
       setPrivate(transport, '_serverCipherType', SSHCipherType.aes128gcm);
+      // A proposal names a MAC beside such a cipher too; it is not used.
+      setPrivate(transport, '_serverMacType', SSHMacType.hmacSha256);
+      expect(getPrivate<Object?>(transport, '_remoteCipherType'), isNull,
+          reason: 'agreed on, and not in force before its keys are');
 
       reflect(transport).invoke(privateSymbol('_applyRemoteKeys'), const []);
 
@@ -246,6 +262,11 @@ void main() {
       expect(remoteIv!.length, SSHCipherType.aes128gcm.ivSize);
       expect(getPrivate<Object?>(transport, '_decryptCipher'), isNull);
       expect(getPrivate<Object?>(transport, '_remoteMac'), isNull);
+      // In force for what comes in, with its keys, and for nothing else.
+      expect(getPrivate<Object?>(transport, '_remoteCipherType'),
+          SSHCipherType.aes128gcm);
+      expect(getPrivate<Object?>(transport, '_remoteMacType'), isNull);
+      expect(getPrivate<Object?>(transport, '_localCipherType'), isNull);
 
       transport.close();
     });
@@ -268,6 +289,12 @@ void main() {
 
       expect(getPrivate<Object?>(transport, '_encryptCipher'), isNotNull);
       expect(getPrivate<Object?>(transport, '_localMac'), isNotNull);
+      expect(getPrivate<Object?>(transport, '_localCipherType'),
+          SSHCipherType.aes128ctr);
+      expect(getPrivate<Object?>(transport, '_localMacType'),
+          SSHMacType.hmacSha256);
+      expect(getPrivate<Object?>(transport, '_remoteCipherType'), isNull);
+      expect(getPrivate<Object?>(transport, '_remoteMacType'), isNull);
 
       transport.close();
     });
@@ -290,6 +317,12 @@ void main() {
 
       expect(getPrivate<Object?>(transport, '_decryptCipher'), isNotNull);
       expect(getPrivate<Object?>(transport, '_remoteMac'), isNotNull);
+      expect(getPrivate<Object?>(transport, '_remoteCipherType'),
+          SSHCipherType.aes128ctr);
+      expect(getPrivate<Object?>(transport, '_remoteMacType'),
+          SSHMacType.hmacSha256);
+      expect(getPrivate<Object?>(transport, '_localCipherType'), isNull);
+      expect(getPrivate<Object?>(transport, '_localMacType'), isNull);
 
       transport.close();
     });
@@ -389,6 +422,9 @@ void main() {
             .invoke(privateSymbol('_applyLocalKeys'), const []),
         throwsA(isA<StateError>()),
       );
+      // Nothing of it was installed: not the cipher by itself, with no keys.
+      expect(getPrivate<Object?>(transport, '_localCipherType'), isNull);
+      expect(getPrivate<Object?>(transport, '_localCipherKey'), isNull);
 
       transport.close();
     });
@@ -411,6 +447,9 @@ void main() {
             .invoke(privateSymbol('_applyRemoteKeys'), const []),
         throwsA(isA<StateError>()),
       );
+      // Nothing of it was installed: not the cipher by itself, with no keys.
+      expect(getPrivate<Object?>(transport, '_remoteCipherType'), isNull);
+      expect(getPrivate<Object?>(transport, '_remoteCipherKey'), isNull);
 
       transport.close();
     });

@@ -120,14 +120,16 @@ class SSH_Message_Userauth_Request extends SSHMessage {
     final methodName = reader.readUtf8();
     switch (methodName) {
       case 'password':
+        // (With a new password, the old one comes first: RFC 4252, 8. The
+        // two were read the other way round.)
         final hasNewPassword = reader.readBool();
         final password = reader.readUtf8();
         if (hasNewPassword) {
-          final oldPassword = reader.readUtf8();
+          final newPassword = reader.readUtf8();
           return SSH_Message_Userauth_Request.newPassword(
             user: user,
-            oldPassword: oldPassword,
-            newPassword: password,
+            oldPassword: password,
+            newPassword: newPassword,
             serviceName: serviceName,
           );
         } else {
@@ -138,9 +140,12 @@ class SSH_Message_Userauth_Request extends SSHMessage {
           );
         }
       case 'publickey':
+        // (Whether a signature follows is said first: RFC 4252, 7. It was
+        // not read, so nothing after it was read as what it is.)
+        final hasSignature = reader.readBool();
         final publicKeyAlgorithm = reader.readUtf8();
         final publicKey = reader.readString();
-        final signature = reader.readString();
+        final signature = hasSignature ? reader.readString() : null;
         return SSH_Message_Userauth_Request.publicKey(
           username: user,
           serviceName: serviceName,
@@ -284,8 +289,10 @@ class SSH_Message_Userauth_Banner extends SSHMessage {
   factory SSH_Message_Userauth_Banner.decode(Uint8List bytes) {
     final reader = SSHMessageReader(bytes);
     reader.skip(1);
-    final message = reader.readUtf8();
-    final language = reader.readUtf8();
+    // Text for a person to read, from whatever file the server keeps it in:
+    // read as far as it can be (a byte that is no UTF-8 ended the connection).
+    final message = reader.readUtf8(allowMalformed: true);
+    final language = reader.readUtf8(allowMalformed: true);
     return SSH_Message_Userauth_Banner(
       message: message,
       language: language,
@@ -319,7 +326,7 @@ class SSH_Message_Userauth_Passwd_ChangeReq extends SSHMessage {
   factory SSH_Message_Userauth_Passwd_ChangeReq.decode(Uint8List bytes) {
     final reader = SSHMessageReader(bytes);
     reader.skip(1);
-    final prompt = reader.readUtf8();
+    final prompt = reader.readUtf8(allowMalformed: true);
     return SSH_Message_Userauth_Passwd_ChangeReq(
       prompt: prompt,
     );
@@ -336,6 +343,51 @@ class SSH_Message_Userauth_Passwd_ChangeReq extends SSHMessage {
   @override
   String toString() {
     return 'SSH_Message_Userauth_Password_Change_Request(prompt: $prompt)';
+  }
+}
+
+/// The server's yes to a question about a key (RFC 4252, 7): it would take
+/// a sign-in with the key it was asked about, which it names as the
+/// question did. It shares its number with the two messages above and
+/// below it: which of the three a message 60 is follows from the way of
+/// signing in that is under way.
+class SSH_Message_Userauth_PkOk extends SSHMessage {
+  static const messageId = 60;
+
+  /// The kind of signature the question named.
+  final String publicKeyAlgorithm;
+
+  /// The key the question named.
+  final Uint8List publicKey;
+
+  SSH_Message_Userauth_PkOk({
+    required this.publicKeyAlgorithm,
+    required this.publicKey,
+  });
+
+  factory SSH_Message_Userauth_PkOk.decode(Uint8List bytes) {
+    final reader = SSHMessageReader(bytes);
+    reader.skip(1);
+    final publicKeyAlgorithm = reader.readUtf8();
+    final publicKey = reader.readString();
+    return SSH_Message_Userauth_PkOk(
+      publicKeyAlgorithm: publicKeyAlgorithm,
+      publicKey: publicKey,
+    );
+  }
+
+  @override
+  Uint8List encode() {
+    final writer = SSHMessageWriter();
+    writer.writeUint8(messageId);
+    writer.writeUtf8(publicKeyAlgorithm);
+    writer.writeString(publicKey);
+    return writer.takeBytes();
+  }
+
+  @override
+  String toString() {
+    return 'SSH_Message_Userauth_PkOk(publicKeyAlgorithm: $publicKeyAlgorithm)';
   }
 }
 
@@ -357,14 +409,15 @@ class SSH_Message_Userauth_InfoRequest implements SSHMessage {
   factory SSH_Message_Userauth_InfoRequest.decode(Uint8List bytes) {
     final reader = SSHMessageReader(bytes);
     reader.skip(1);
-    final name = reader.readUtf8();
-    final instruction = reader.readUtf8();
-    final lang = reader.readUtf8();
+    // What the server asks a person: read as far as it can be.
+    final name = reader.readUtf8(allowMalformed: true);
+    final instruction = reader.readUtf8(allowMalformed: true);
+    final lang = reader.readUtf8(allowMalformed: true);
 
     final prompts = <SSHUserInfoPrompt>[];
     final promptCount = reader.readUint32();
     for (var i = 0; i < promptCount; i++) {
-      final prompt = reader.readUtf8();
+      final prompt = reader.readUtf8(allowMalformed: true);
       final echo = reader.readBool();
       prompts.add(SSHUserInfoPrompt(prompt, echo));
     }
@@ -394,7 +447,7 @@ class SSH_Message_Userauth_InfoRequest implements SSHMessage {
 
   @override
   String toString() {
-    return '$runtimeType(name: $name, instruction: $instruction, lang: $lang, prompts: $prompts)';
+    return 'SSH_Message_Userauth_InfoRequest(name: $name, instruction: $instruction, lang: $lang, prompts: $prompts)';
   }
 }
 
@@ -431,8 +484,11 @@ class SSH_Message_Userauth_InfoResponse implements SSHMessage {
     return writer.takeBytes();
   }
 
+  /// How many answers it carries, and none of them: an answer is a
+  /// password or a one-time code, and a trace prints every message a client
+  /// sends.
   @override
   String toString() {
-    return '$runtimeType(responses: $responses)';
+    return 'SSH_Message_Userauth_InfoResponse(responses.length=${responses.length})';
   }
 }

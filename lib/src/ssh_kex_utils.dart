@@ -30,9 +30,13 @@ abstract class SSHKexUtils {
     return null;
   }
 
+  /// [groupExchangeShortest] is the shortest group the client asked for in
+  /// a group exchange: the hash is made of the lengths that were on the
+  /// wire (RFC 4419, 3).
   static Uint8List computeExchangeHash({
     required Digest digest,
     SSHKexDH? groupExchange,
+    int groupExchangeShortest = SSHKexDH.gexMin,
     required String clientVersion,
     required String serverVersion,
     required Uint8List clientKexInit,
@@ -50,7 +54,7 @@ abstract class SSHKexUtils {
     writer.writeString(hostKey);
 
     if (groupExchange != null) {
-      writer.writeUint32(SSHKexDH.gexMin);
+      writer.writeUint32(groupExchangeShortest);
       writer.writeUint32(SSHKexDH.gexPref);
       writer.writeUint32(SSHKexDH.gexMax);
       writer.writeMpint(groupExchange.p);

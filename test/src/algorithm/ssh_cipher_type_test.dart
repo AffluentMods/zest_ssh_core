@@ -138,6 +138,9 @@ void main() {
           SSHCipherType.chacha20poly1305,
           SSHCipherType.aes256ctr,
           SSHCipherType.aes128ctr,
+          // AES-GCM after what was offered before it (ssh_default_ciphers_test.dart).
+          SSHCipherType.aes256gcm,
+          SSHCipherType.aes128gcm,
         ]));
 
     expect(

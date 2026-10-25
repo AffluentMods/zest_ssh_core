@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:zest_ssh_core/src/algorithm/ssh_cipher_chacha20_poly1305.dart';
 import 'package:zest_ssh_core/src/algorithm/ssh_send_crypto.dart';
+import 'package:zest_ssh_core/src/exceptions/ssh_exceptions.dart' show SSHMacMismatchException;
 import 'package:zest_ssh_core/src/hostkey/hostkey_ecdsa.dart';
 import 'package:zest_ssh_core/src/hostkey/hostkey_rsa.dart';
 import 'package:zest_ssh_core/src/kex/kex_dh.dart';
@@ -12,6 +13,8 @@ import 'package:zest_ssh_core/src/kex/kex_nist.dart';
 import 'package:zest_ssh_core/src/kex/kex_mlkem768x25519.dart';
 import 'package:zest_ssh_core/src/kex/kex_sntrup761x25519.dart';
 import 'package:zest_ssh_core/src/kex/kex_x25519.dart';
+import 'package:zest_ssh_core/src/message/msg_disconnect.dart';
+import 'package:zest_ssh_core/src/message/msg_ext_info.dart';
 import 'package:zest_ssh_core/src/message/msg_userauth.dart';
 import 'package:zest_ssh_core/src/ssh_algorithm.dart';
 import 'package:zest_ssh_core/src/version.dart';
@@ -59,7 +62,10 @@ typedef SSHVersionExchangeHandler = void Function(
   String remoteVersion,
 );
 
-/// Called when key exchange algorithms have been negotiated.
+/// Called when key exchange algorithms have been negotiated, with what was
+/// agreed on for what the client sends: the cipher, and the MAC beside it.
+/// [mac] is empty where the cipher checks its packets by itself
+/// (chacha20-poly1305, AES-GCM) and so has none.
 typedef SSHKexNegotiatedHandler = void Function({
   required String kex,
   required String cipher,
@@ -120,6 +126,11 @@ class SSHTransport {
   /// Called when the host key has been received.
   final SSHHostKeyReceivedHandler? onHostKeyReceived;
 
+  /// Called when the server has said something of itself
+  /// (SSH_MSG_EXT_INFO): [serverExtensions] and [serverSignatureAlgorithms]
+  /// hold what it said.
+  final void Function()? onExtInfo;
+
   final bool disableHostkeyVerification;
 
   /// A [Future] that completes when the transport is closed, or when an error
@@ -148,11 +159,37 @@ class SSHTransport {
     this.onKexNegotiated,
     this.onKexCompleted,
     this.onHostKeyReceived,
+    this.onExtInfo,
     this.disableHostkeyVerification = false,
-  }) {
+    this.rekeyAfterBytes = defaultRekeyAfterBytes,
+    this.rekeyAfterPackets = defaultRekeyAfterPackets,
+  })  : assert(rekeyAfterBytes > 0),
+        assert(rekeyAfterPackets > 0) {
     _initSocket();
     _startHandshake();
   }
+
+  /// How many bytes of what packets carry go out, or come in, under one set
+  /// of keys before this side asks for new ones. A gigabyte where nothing
+  /// is said: what RFC 4253 (9) recommends, and what an OpenSSH client and
+  /// server keep to under chacha20-poly1305.
+  final int rekeyAfterBytes;
+
+  /// How many packets go out, or come in, under one set of keys before this
+  /// side asks for new ones. 2^31 where nothing is said, as OpenSSH has it.
+  ///
+  /// A packet is numbered in 32 bits, and under chacha20-poly1305 that
+  /// number is the one thing no two packets under the same keys may share:
+  /// a side must not send more than 2^32 packets under one set of keys (RFC
+  /// 4344, 3.1). Where twice this many, less one, have gone one way and the
+  /// new keys that were asked for have not come, the connection is ended.
+  final int rekeyAfterPackets;
+
+  /// [rekeyAfterBytes] where nothing is said.
+  static const defaultRekeyAfterBytes = 1 << 30;
+
+  /// [rekeyAfterPackets] where nothing is said.
+  static const defaultRekeyAfterPackets = 1 << 31;
 
   final _doneCompleter = Completer<void>();
 
@@ -187,6 +224,10 @@ class SSHTransport {
 
   SSHHostkeyType? _hostkeyType;
 
+  /// The cipher and the MAC of each direction that the two sides agreed on
+  /// in the key exchange in progress, or in the last one: what the keys of
+  /// that exchange are made for. They are not what protects packets until
+  /// those keys are installed, see [_localCipherType].
   SSHCipherType? _clientCipherType;
 
   SSHCipherType? _serverCipherType;
@@ -194,6 +235,32 @@ class SSHTransport {
   SSHMacType? _clientMacType;
 
   SSHMacType? _serverMacType;
+
+  /// What protects the packets of each direction NOW: the cipher, and the
+  /// MAC where the cipher does not check its packets by itself, whose keys
+  /// are in force. Null until that direction's first NEWKEYS.
+  ///
+  /// What an exchange agrees on is taken into use with its keys: by each
+  /// side for what it sends from its own NEWKEYS on, and for what it reads
+  /// from the other side's NEWKEYS on (RFC 4253, 7.3). Until then
+  /// everything goes as it did, the rest of that exchange too. So these are
+  /// set where the keys are installed ([_applyLocalKeys],
+  /// [_applyRemoteKeys]) and nowhere else, and whatever packs or reads a
+  /// packet asks these, and never what was only agreed on.
+  /// (The packet paths asked what was agreed on until this was held. At the
+  /// first exchange nothing is in force, so nothing came of it there. At a
+  /// later one that agreed on another cipher or MAC, the client's start of
+  /// the exchange and its NEWKEYS went out under the new framing with the
+  /// old keys, or in the clear, and what the server sent before its NEWKEYS
+  /// was read as if it were under the new ones. See the changelog, "What an
+  /// exchange agrees on is taken into use with its keys".)
+  SSHCipherType? _localCipherType;
+
+  SSHMacType? _localMacType;
+
+  SSHCipherType? _remoteCipherType;
+
+  SSHMacType? _remoteMacType;
 
   SSHKex? _kex;
 
@@ -242,11 +309,28 @@ class SSHTransport {
   /// A [Mac] used to authenticate data sent from the other side.
   Mac? _remoteMac;
 
-  /// ChaCha20-Poly1305 cipher for encrypting outbound packets.
-  SSHCipherChaCha20Poly1305? _localChaCha;
-
-  /// ChaCha20-Poly1305 cipher for decrypting inbound packets.
+  /// ChaCha20-Poly1305 cipher for decrypting inbound packets. (What goes out
+  /// under that cipher is encrypted from [_localCipherKey], packet by packet.)
   SSHCipherChaCha20Poly1305? _remoteChaCha;
+
+  /// How many packets have gone out, and how many have come in, under the
+  /// AES-GCM keys in force. A packet's nonce is the one its keys give,
+  /// counted on by this (RFC 5647, 7.1): by the packets since the keys were
+  /// taken into use, and not by the number of the packet, which starts
+  /// again with the keys only where the strict key exchange is in force.
+  /// (It was the number of the packet until this was held: with a server
+  /// that has no strict exchange neither side could read the other. See the
+  /// changelog, "AES-GCM packets are counted from the keys".)
+  var _localGcmPackets = 0;
+  var _remoteGcmPackets = 0;
+
+  /// How many packets, and how many bytes of what they carry, have gone out
+  /// and have come in under the keys in force: what new keys are asked for
+  /// by ([rekeyAfterBytes], [rekeyAfterPackets]).
+  var _sentPacketsUnderKeys = 0;
+  var _sentBytesUnderKeys = 0;
+  var _receivedPacketsUnderKeys = 0;
+  var _receivedBytesUnderKeys = 0;
 
   final _localPacketSN = SSHPacketSN.fromZero();
 
@@ -261,6 +345,18 @@ class SSHTransport {
   /// KEXINIT, indicating support for the Terrapin strict KEX extension.
   bool _serverSupportsStrictKex = false;
 
+  /// The kinds of signature the server has said it takes from a key that
+  /// signs in ("server-sig-algs", RFC 8308, 3.1), in its order, or null
+  /// where it has not said. It says so with SSH_MSG_EXT_INFO, which a
+  /// client asks for in its first proposal ([_handleMessageExtInfo]).
+  List<String>? get serverSignatureAlgorithms => _serverSignatureAlgorithms;
+  List<String>? _serverSignatureAlgorithms;
+
+  /// The names of what the server has said of itself with
+  /// SSH_MSG_EXT_INFO, in its order. Empty where it has said nothing.
+  List<String> get serverExtensions => _serverExtensions;
+  List<String> _serverExtensions = const [];
+
   /// Timestamp when the current key exchange round started.
   DateTime? _kexStartTime;
 
@@ -270,6 +366,27 @@ class SSHTransport {
   /// Whether we have already sent our SSH_MSG_KEXINIT for the ongoing key
   /// exchange round. This is reset when the exchange finishes.
   bool _sentKexInit = false;
+
+  /// Where the key exchange in progress stands, as what the server may send
+  /// next. An exchange is one proposal, one answer (a group first, for a
+  /// group exchange) and one NEWKEYS, in that order, and each is taken once:
+  /// anything else for the exchange ends the connection.
+  ///
+  /// It is held to that because the host key that comes with the answer is
+  /// looked up or put to the person, which takes time. Were a second answer
+  /// taken in that time, it would replace the secret the session is about to
+  /// use: whoever sits between this client and the server could put the real
+  /// server's answer, signed by the key the person trusts, between two of its
+  /// own, and have its own secret in force under the approval of the trusted
+  /// key. (The transport took every answer until this was held: see the
+  /// changelog, "The answer to a key exchange is taken once".)
+  _KexStep _kexStep = _KexStep.idle;
+
+  /// Whether our own NEWKEYS for the exchange is still to be sent: from the
+  /// answer until its host key is approved (on a re-key, where the key is
+  /// the approved one, at once). The server may not open another exchange
+  /// before it is sent.
+  bool _localNewKeysOwed = false;
 
   /// Tracks the last sequence number used for an inbound ChaCha20-Poly1305
   /// packet. Used to enforce strict monotonicity (Finding 1.2).
@@ -373,16 +490,11 @@ class SSHTransport {
     // encryption is established, refuse rather than silently fall back to
     // plaintext (the old behaviour: `if (_encryptCipher == null) sink.add`).
     //
-    // Encryption is "established" once ANY local cipher is keyed. AEAD
-    // (AES-GCM) keys `_localCipherKey`, ChaCha20-Poly1305 keys `_localChaCha`,
-    // and block/stream ciphers key `_encryptCipher`. Checking only
-    // `_encryptCipher` (the previous behaviour) wrongly treated a fully
-    // encrypted GCM/ChaCha connection - the defaults - as cleartext and
-    // refused to send any application data over it.
-    final localEncryptionEstablished = _encryptCipher != null ||
-        _localCipherKey != null ||
-        _localChaCha != null;
-    if (!localEncryptionEstablished && data.isNotEmpty) {
+    // Encryption is "established" once the keys of this direction are
+    // installed, whatever the cipher: [_localCipherType] says what protects
+    // what goes out now, and is null until then.
+    final localCipherType = _localCipherType;
+    if (localCipherType == null && data.isNotEmpty) {
       final messageId = SSHMessage.readMessageId(data);
       final isKexOrTransport = messageId <= _maxPreHandshakeMessageId ||
           (messageId >= 20 && messageId <= 49);
@@ -394,29 +506,23 @@ class SSHTransport {
       }
     }
 
-    // Check if encryption is enabled and if we have MAC types initialized
-    final clientMacType = _clientMacType;
-    final serverMacType = _serverMacType;
-    final macType = isClient ? clientMacType : serverMacType;
-    final localCipherType = isClient ? _clientCipherType : _serverCipherType;
-
     // ChaCha20-Poly1305 has its own packet framing with encrypted length
-    if (_localChaCha != null && localCipherType != null && localCipherType.isChaCha) {
+    if (localCipherType != null && localCipherType.isChaCha) {
       _sendChaChaPacket(data, localCipherType);
       _localPacketSN.increase();
+      _sentUnderKeys(data.length);
       return;
     }
 
-    if (localCipherType != null &&
-        localCipherType.isAead &&
-        _localCipherKey != null &&
-        _localIV != null) {
+    if (localCipherType != null && localCipherType.isAead) {
       _sendAeadPacket(data, localCipherType);
       _localPacketSN.increase();
+      _sentUnderKeys(data.length);
       return;
     }
 
-    final isEtm = _encryptCipher != null && macType != null && macType.isEtm;
+    final macType = _localMacType;
+    final isEtm = macType != null && macType.isEtm;
 
     // For ETM, we need to handle the packet differently
     if (isEtm) {
@@ -479,13 +585,15 @@ class SSHTransport {
     } else {
       // For standard encryption or no encryption:
       // Use the original packet packing logic
-      final packetAlign = _encryptCipher == null
+      final packetAlign = localCipherType == null
           ? SSHPacket.minAlign
           : max(SSHPacket.minAlign, _encryptCipher!.blockSize);
 
       final packet = SSHPacket.pack(data, align: packetAlign);
 
-      if (_encryptCipher == null) {
+      // In the clear while no keys of this direction are in force, and
+      // never after: with a cipher in force a packet goes out under it.
+      if (localCipherType == null) {
         _writeToSocket(packet);
       } else {
         final mac = _localMac!;
@@ -504,6 +612,54 @@ class SSHTransport {
     }
 
     _localPacketSN.increase();
+    if (localCipherType != null) _sentUnderKeys(data.length);
+  }
+
+  /// A packet has gone out under keys, with [bytes] of what it carries.
+  void _sentUnderKeys(int bytes) {
+    _sentPacketsUnderKeys++;
+    _sentBytesUnderKeys += bytes;
+    _newKeysWhenDue();
+  }
+
+  /// A packet has come in under keys, with [bytes] of what it carried.
+  void _receivedUnderKeys(int bytes) {
+    _receivedPacketsUnderKeys++;
+    _receivedBytesUnderKeys += bytes;
+    _newKeysWhenDue();
+  }
+
+  /// Asks for new keys once enough has gone one way under those in force
+  /// ([rekeyAfterBytes], [rekeyAfterPackets]), and ends the connection
+  /// where they were asked for and have not come by the time a count of
+  /// packets would run round.
+  ///
+  /// This side asked for none by itself until this was held: it took new
+  /// keys when the other side asked, which an OpenSSH server does after
+  /// about a gigabyte and not every server does at all. With a server that
+  /// never asks, the 2^32nd packet under chacha20-poly1305 came under a
+  /// nonce that had been used with the same keys. (See the changelog, "New
+  /// keys are asked for".)
+  void _newKeysWhenDue() {
+    if (isClosed || _isInitialKex) return;
+    final packets = max(_sentPacketsUnderKeys, _receivedPacketsUnderKeys);
+    if (packets >= 2 * rekeyAfterPackets - 1) {
+      closeWithError(SSHHandshakeError(
+        'New keys were asked for and have not come: $packets packets have '
+        'gone one way under the keys in force, and no more may',
+      ));
+      return;
+    }
+    // An exchange that is under way ends with new keys, and with them the
+    // counts begin again.
+    if (_kexInProgress || _localNewKeysOwed) return;
+    if (packets >= rekeyAfterPackets ||
+        _sentBytesUnderKeys >= rekeyAfterBytes ||
+        _receivedBytesUnderKeys >= rekeyAfterBytes) {
+      printDebug?.call('SSHTransport: asking for new keys ($packets packets one way, '
+          '$_sentBytesUnderKeys bytes out and $_receivedBytesUnderKeys in under those in force)');
+      rekey();
+    }
   }
 
   void _sendAeadPacket(Uint8List data, SSHCipherType cipherType) {
@@ -522,7 +678,7 @@ class SSHTransport {
     _writeToSocket(encryptGcmPacket(
       _localCipherKey!,
       _localIV!,
-      _localPacketSN.value,
+      _localGcmPackets++,
       aad,
       plaintext,
     ));
@@ -537,8 +693,7 @@ class SSHTransport {
       ..setRange(1, 1 + data.length, data)
       ..setRange(1 + data.length, packetLength, randomBytes(paddingLength));
 
-    // Same pure function the crypto worker runs; _localChaCha was built from
-    // _localCipherKey (1121), so this is byte-identical.
+    // Same pure function the crypto worker runs.
     _writeToSocket(encryptChaChaPacket(
       _localCipherKey!,
       _localPacketSN.value,
@@ -555,13 +710,13 @@ class SSHTransport {
   Uint8List _processAead({
     required Uint8List key,
     required Uint8List iv,
-    required int sequence,
+    required int packetsBefore,
     required Uint8List aad,
     required Uint8List input,
     required bool forEncryption,
   }) {
     final cipher = GCMBlockCipher(AESEngine());
-    final nonce = _nonceForSequence(iv, sequence);
+    final nonce = _nonceForSequence(iv, packetsBefore);
     cipher.init(
       forEncryption,
       AEADParameters(KeyParameter(key), 128, nonce, aad),
@@ -571,16 +726,54 @@ class SSHTransport {
 
   // Delegates to the shared pure helper so send (worker) and receive share one
   // nonce derivation and cannot drift.
-  Uint8List _nonceForSequence(Uint8List iv, int sequence) =>
-      sshAeadNonceForSequence(iv, sequence);
+  Uint8List _nonceForSequence(Uint8List iv, int packetsBefore) =>
+      sshAeadNonceForSequence(iv, packetsBefore);
 
+  /// Ends the connection from this side. Where its keys are in force it
+  /// says so first (SSH_MSG_DISCONNECT, RFC 4253, 11.1), so that the other
+  /// side reads a connection that was ended and not one that broke: a
+  /// server writes "Received disconnect from ..." of the one and
+  /// "Connection closed by ..." of the other. (It said nothing, whatever it
+  /// was closed for.) The socket is given a moment to send it, and is closed
+  /// then. A connection that ends over an error ([closeWithError]) says
+  /// nothing: what was wrong with it is not told to the other side.
   void close() {
     printDebug?.call('SSHTransport.close');
     if (isClosed) return;
+    final said = _sayGoodbye();
     _socketSubscription?.cancel();
     _socketSubscription = null;
     _doneCompleter.complete();
-    socket.destroy();
+    if (!said) {
+      socket.destroy();
+      return;
+    }
+    // A socket that is destroyed drops what it has not sent yet.
+    unawaited(
+      Future.sync(socket.flush)
+          .timeout(_goodbyePatience)
+          .then((_) {}, onError: (Object _) {})
+          .whenComplete(socket.destroy),
+    );
+  }
+
+  /// How long a goodbye is given to leave before the socket is closed on it.
+  static const _goodbyePatience = Duration(seconds: 2);
+
+  /// Tells the other side that this side ends the connection, and whether
+  /// it could be told: under keys only (nothing is said in the clear, where
+  /// anybody on the line could have said it), and not while the socket is
+  /// being drained, which takes no write until that is over.
+  bool _sayGoodbye() {
+    if (_localCipherType == null || _draining) return false;
+    try {
+      // 11: SSH_DISCONNECT_BY_APPLICATION.
+      sendPacket(SSH_Message_Disconnect(reasonCode: 11, description: 'disconnected by application').encode());
+      return true;
+    } catch (_) {
+      // A socket that has gone takes no goodbye.
+      return false;
+    }
   }
 
   void closeWithError(SSHError error, [StackTrace? stackTrace]) {
@@ -602,7 +795,13 @@ class SSHTransport {
     socket.done.catchError(_onSocketError);
   }
 
+  /// How many bytes have come from the other side so far, whatever they
+  /// were: for whoever looks at whether the connection has gone quiet.
+  int get bytesReceived => _bytesReceived;
+  int _bytesReceived = 0;
+
   void _onSocketData(Uint8List data) {
+    _bytesReceived += data.length;
     _buffer.add(data);
     try {
       _processData();
@@ -610,16 +809,17 @@ class SSHTransport {
       printDebug?.call('SSHTransport: SSH error during packet processing: $e');
       closeWithError(e, stackTrace);
     } catch (e, stackTrace) {
-      // Any NON-SSHError thrown while parsing an incoming packet - e.g. a
-      // RangeError or FormatException from decoding a truncated/crafted field
-      // (readString/readMpint on an attacker-controlled length) during the
-      // still-unauthenticated KEX - must tear the connection down cleanly.
+      // What is thrown here was thrown in the exchange of versions: packets
+      // are handled by [_processPackets], which ends the connection itself
+      // and throws nothing. It must end the connection all the same.
       // Rethrowing escapes to the zone as an uncaught async error: the
       // subscription is never cancelled and the connect future never
-      // completes, hanging the client forever (a pre-auth DoS). Wrap it as an
-      // SSHError so `closeWithError` rejects the pending handshake instead.
-      printDebug?.call('SSHTransport: Unexpected error during packet processing: $e\n$stackTrace');
-      closeWithError(SSHPacketError('Malformed packet: $e'), stackTrace);
+      // completes, hanging the client forever (a pre-auth DoS). Wrap it as
+      // an SSHError so `closeWithError` rejects the pending handshake
+      // instead. (It was said to be a malformed packet, where no packet had
+      // come yet.)
+      printDebug?.call('SSHTransport: Unexpected error in the version exchange: $e\n$stackTrace');
+      closeWithError(SSHHandshakeError('The version exchange failed: $e'), stackTrace);
     }
   }
 
@@ -645,29 +845,50 @@ class SSHTransport {
     }
   }
 
+  /// The longest line taken during the version exchange.
+  static const _maxVersionLineBytes = 10240;
+
+  /// The most a peer may send in lines before its version string.
+  static const _maxBeforeVersionBytes = 32768;
+
+  /// Bytes of lines before the version string passed over so far.
+  var _beforeVersionBytes = 0;
+
   void _processVersionExchange() {
     printDebug?.call('SSHTransport._processVersionExchange');
 
-    if (_buffer.length > 10240) {
-      throw SSHHandshakeError('Version exchange too long');
-    }
-
-    final bufferString = latin1.decode(_buffer.data);
-
-    // SSH version exchange is terminated by \r\n.
-    var index = bufferString.indexOf('\r\n');
-    if (index == -1) {
-      // In the (rare) case SSH-2 version string is terminated by \n only (observed on Synology DS120j 2021)
-      index = bufferString.indexOf('\n');
-      if (index == -1) {
-        throw SSHHandshakeError('Version exchange not terminated');
+    // The version string is a line of text on a stream: it may arrive in
+    // more than one read, and a peer may send other lines before it (RFC
+    // 4253, 4.2), none of which begins with "SSH-". Lines are taken as they
+    // end; what has not ended yet waits for the rest.
+    String versionString;
+    while (true) {
+      final data = _buffer.data;
+      // A line ends in \r\n, or in \n alone (observed on Synology DS120j 2021).
+      final end = data.indexOf(0x0A);
+      if (end == -1) {
+        if (data.length > _maxVersionLineBytes) {
+          throw SSHHandshakeError('Version exchange too long');
+        }
+        return;
       }
-      _buffer.consume(index + 1);
-    } else {
-      _buffer.consume(index + 2);
+      if (end > _maxVersionLineBytes) {
+        throw SSHHandshakeError('Version exchange too long');
+      }
+      final cut = end > 0 && data[end - 1] == 0x0D ? end - 1 : end;
+      final line = latin1.decode(Uint8List.sublistView(data, 0, cut));
+      _buffer.consume(end + 1);
+      if (line.startsWith('SSH-')) {
+        versionString = line;
+        break;
+      }
+      _beforeVersionBytes += end + 1;
+      if (_beforeVersionBytes > _maxBeforeVersionBytes) {
+        throw SSHHandshakeError('Version exchange too long');
+      }
+      printDebug?.call('SSHTransport: a line before the version string was passed over');
     }
 
-    final versionString = bufferString.substring(0, index);
     // RFC compatibility: SSH-1.99 banners indicate SSH-2 support with SSH-1 fallback.
     if (!(versionString.startsWith('SSH-2.0-') ||
         versionString.startsWith('SSH-1.99-'))) {
@@ -729,16 +950,26 @@ class SSHTransport {
     if (_processingPackets) return;
     _processingPackets = true;
 
+    // The number of the message that is being handled, once a packet has
+    // been taken off the line and has a message in it: for what is said of
+    // something thrown meanwhile that is none of the package's own errors.
+    int? handling;
     try {
       var processedSinceYield = 0;
       final sinceYield = Stopwatch()..start();
       while (_buffer.isNotEmpty && !isClosed) {
+        handling = null;
         final payload = _consumePacket();
         if (payload == null) {
           break;
         }
 
+        handling = SSHMessage.readMessageId(payload);
         _handleMessage(payload);
+
+        // What came in under keys is counted, and new keys are asked for
+        // when it is time. (A NEWKEYS has just put the counts at nought.)
+        if (_remoteUnderKeys) _receivedUnderKeys(payload.length);
 
         // After a strict-KEX sequence number reset (in _handleMessageNewKeys),
         // skip one increment so the next encrypted packet uses nonce 0.
@@ -768,13 +999,28 @@ class SSHTransport {
       printDebug?.call('SSHTransport: SSH error during packet processing: $e');
       closeWithError(e, stackTrace);
     } catch (e, stackTrace) {
-      // Mirror [_onSocketData]: any non-SSHError raised while parsing an
-      // incoming packet (a RangeError/FormatException from a crafted field)
-      // must tear the connection down cleanly rather than escape as an
-      // uncaught async error that hangs the connect future forever.
+      // Mirror [_onSocketData]: any non-SSHError raised while a packet is
+      // taken off the line or its message is handled must tear the
+      // connection down cleanly rather than escape as an uncaught async
+      // error that hangs the connect future forever.
+      //
+      // It is said by what is known of it. A packet that could not be taken
+      // off the line, or has no message in it, is a malformed packet. Once
+      // the message is known by its number, what is thrown may come of the
+      // message (a field that is cut short or cannot be read: a RangeError,
+      // a FormatException) or of what handles it (the client's own handler,
+      // something an application asked to be told of): which, this cannot
+      // tell, so it says the number and what was thrown. (All of it was a
+      // "Malformed packet", and whoever read that of a handler that had
+      // failed went looking for what the server had sent wrong.)
       printDebug?.call(
           'SSHTransport: Unexpected error during packet processing: $e\n$stackTrace');
-      closeWithError(SSHPacketError('Malformed packet: $e'), stackTrace);
+      closeWithError(
+        SSHPacketError(
+          handling == null ? 'Malformed packet: $e' : 'Message $handling could not be read or handled: $e',
+        ),
+        stackTrace,
+      );
     } finally {
       _processingPackets = false;
     }
@@ -784,10 +1030,21 @@ class SSHTransport {
   /// WITHOUT `packet length`, `padding length`, `padding` and `MAC`. Returns
   /// `null` if there is not enough data in the buffer to read the packet.
   Uint8List? _consumePacket() {
-    return (_decryptCipher == null && _remoteCipherKey == null)
+    final remoteCipherType = _remoteCipherType;
+    return remoteCipherType == null
         ? _consumeClearTextPacket()
-        : _consumeEncryptedPacket();
+        : _consumeEncryptedPacket(remoteCipherType);
   }
+
+  /// Whether what the other side sends comes under keys by now: from its
+  /// first NEWKEYS on.
+  bool get _remoteUnderKeys => _remoteCipherType != null;
+
+  /// Whether what the other side sends is its own by now: it comes under
+  /// keys and, where this side is the client, under those of a host key that
+  /// was approved. Until then it comes in the clear, or from whoever holds a
+  /// host key nobody has approved yet: from anybody on the way.
+  bool get _remoteIsItself => _remoteUnderKeys && (isServer || _hostkeyVerified);
 
   Uint8List? _consumeClearTextPacket() {
 
@@ -810,21 +1067,15 @@ class SSHTransport {
     return Uint8List.sublistView(packet, 5, packet.length - paddingLength);
   }
 
-  Uint8List? _consumeEncryptedPacket() {
-
-    final remoteCipherType = isClient ? _serverCipherType : _clientCipherType;
-
+  /// Reads a packet under [remoteCipherType], the cipher whose keys are in
+  /// force for what the other side sends.
+  Uint8List? _consumeEncryptedPacket(SSHCipherType remoteCipherType) {
     // ChaCha20-Poly1305 has its own framing with encrypted length
-    if (remoteCipherType != null &&
-        remoteCipherType.isChaCha &&
-        _remoteChaCha != null) {
+    if (remoteCipherType.isChaCha) {
       return _consumeChaChaPacket();
     }
 
-    if (remoteCipherType != null &&
-        remoteCipherType.isAead &&
-        _remoteCipherKey != null &&
-        _remoteIV != null) {
+    if (remoteCipherType.isAead) {
       return _consumeAeadPacket(remoteCipherType);
     }
 
@@ -833,7 +1084,7 @@ class SSHTransport {
       return null;
     }
 
-    final macType = isClient ? _serverMacType! : _clientMacType!;
+    final macType = _remoteMacType!;
     final isEtm = macType.isEtm;
     final macLength = _remoteMac!.macSize;
 
@@ -916,6 +1167,10 @@ class SSHTransport {
 
       final packetLength = SSHPacket.readPacketLength(_decryptBuffer.data);
       _verifyPacketLength(packetLength);
+      // A packet of this kind is encrypted whole, its length with it, block
+      // by block: one that is no whole number of blocks is none. (Blocks
+      // were read until the packet was there, into the MAC behind it.)
+      if ((4 + packetLength) % blockSize != 0) throw _damagedPacket(itsLength: true);
 
       if (_buffer.length + _decryptBuffer.length <
           4 + packetLength + macLength) {
@@ -928,12 +1183,16 @@ class SSHTransport {
       }
 
       final packet = _decryptBuffer.consume(packetLength + 4);
+      // The MAC first: nothing of the packet is looked into before it has
+      // passed its check. (Its padding was, and a packet that was changed
+      // on the way was then said by what its padding looked like, with the
+      // numbers in it.)
+      final mac = _buffer.consume(macLength);
+      _verifyPacketMac(packet, mac, isEncrypted: false);
+
       final paddingLength = SSHPacket.readPaddingLength(packet);
       final payloadLength = packetLength - paddingLength - 1;
       _verifyPacketPadding(payloadLength, paddingLength);
-
-      final mac = _buffer.consume(macLength);
-      _verifyPacketMac(packet, mac, isEncrypted: false);
 
       return Uint8List.sublistView(packet, 5, packet.length - paddingLength);
     }
@@ -976,12 +1235,17 @@ class SSHTransport {
     final tag = _buffer.consume(tagLength);
 
     // Decrypt and verify MAC
-    final plaintext = chacha.decrypt(
-      encLenBytes,
-      encPayload,
-      tag,
-      _remotePacketSN.value,
-    );
+    final Uint8List plaintext;
+    try {
+      plaintext = chacha.decrypt(
+        encLenBytes,
+        encPayload,
+        tag,
+        _remotePacketSN.value,
+      );
+    } on SSHMacMismatchException {
+      throw _damagedPacket();
+    }
 
     final paddingLength = plaintext[0];
     final payloadLength = packetLength - paddingLength - 1;
@@ -1019,14 +1283,15 @@ class SSHTransport {
       plaintext = _processAead(
         key: _remoteCipherKey!,
         iv: _remoteIV!,
-        sequence: _remotePacketSN.value,
+        packetsBefore: _remoteGcmPackets,
         aad: aad,
         input: encryptedInput,
         forEncryption: false,
       );
     } on InvalidCipherTextException {
-      throw SSHPacketError('AEAD authentication failed');
+      throw _damagedPacket();
     }
+    _remoteGcmPackets++;
 
     final paddingLength = plaintext[0];
     final payloadLength = packetLength - paddingLength - 1;
@@ -1036,9 +1301,32 @@ class SSHTransport {
 
   void _verifyPacketLength(int packetLength) {
     if (packetLength > SSHPacket.maxLength) {
+      // Under keys the length of a packet is read before the packet can be
+      // checked, and a packet comes as its sender made it or not at all.
+      if (_remoteUnderKeys) throw _damagedPacket(itsLength: true);
       throw SSHPacketError('Packet too long: $packetLength');
     }
   }
+
+  /// What a packet under keys ends the connection with when it does not
+  /// pass its check, or has a length no packet has ([itsLength]): the same
+  /// whatever protects the packets, with [SSHPacketError.damaged] set for
+  /// an application to say it by.
+  ///
+  /// The words say what is known and no more: the packet is not what the
+  /// other side made with the keys both sides arrived at. That is so when
+  /// it was changed on the way, and when the two sides do not protect their
+  /// packets the same way (keys that differ, a count of packets that
+  /// differs). There is nothing of the packet in them. (They held the check
+  /// value it came with and the one it should have had, which is made with
+  /// the session's key.)
+  static SSHPacketError _damagedPacket({bool itsLength = false}) => SSHPacketError(
+        'A packet from the other side '
+        '${itsLength ? 'has a length that no packet has' : 'did not pass its check'}: '
+        'it was changed or damaged on the way, or the two sides do not protect '
+        'their packets the same way',
+        damaged: true,
+      );
 
   /// Verifies that the padding of the packet is correct. Throws [SSHPacketError]
   /// if the padding is incorrect.
@@ -1058,31 +1346,24 @@ class SSHTransport {
       );
     }
 
-    final remoteCipherType = isClient ? _serverCipherType : _clientCipherType;
-
-    // Whether the peer's packets are ALREADY protected by an AEAD / ChaCha
-    // cipher, i.e. remote keys were applied after NEWKEYS. The same tests
-    // _consumeEncryptedPacket uses to pick its framing. A cipher that is
-    // merely negotiated (KEXINIT done, NEWKEYS not yet received) does not
-    // count: the KEX reply and NEWKEYS themselves still travel in the clear
-    // and follow the plain 5-byte-header alignment. Deciding by the
-    // negotiated type alone rejected valid cleartext replies whose payload
-    // length happened to make the two rules differ (an ECDH P-256 reply
-    // signed with an Ed25519 host key, for one).
-    final remoteAeadActive = remoteCipherType != null &&
-        ((remoteCipherType.isChaCha && _remoteChaCha != null) ||
-            (remoteCipherType.isAead &&
-                !remoteCipherType.isChaCha &&
-                _remoteCipherKey != null &&
-                _remoteIV != null));
+    // The cipher whose keys are in force for what the peer sends, the one
+    // _consumePacket picks its framing by. A cipher that is merely
+    // negotiated (KEXINIT done, NEWKEYS not yet received) is not that: the
+    // KEX reply and NEWKEYS still travel as before, in the clear at the
+    // first exchange, where they follow the plain 5-byte-header alignment.
+    // (Deciding by the negotiated type rejected valid cleartext replies
+    // whose payload length happened to make the two rules differ: an ECDH
+    // P-256 reply signed with an Ed25519 host key, for one.)
+    final remoteCipherType = _remoteCipherType;
+    final remoteAeadActive = remoteCipherType != null && remoteCipherType.isAead;
 
     int expectedPacketAlign;
-    if (_decryptCipher != null) {
-      expectedPacketAlign = max(SSHPacket.minAlign, _decryptCipher!.blockSize);
+    if (remoteCipherType == null) {
+      expectedPacketAlign = SSHPacket.minAlign;
     } else if (remoteAeadActive) {
       expectedPacketAlign = max(SSHPacket.minAlign, remoteCipherType.blockSize);
     } else {
-      expectedPacketAlign = SSHPacket.minAlign;
+      expectedPacketAlign = max(SSHPacket.minAlign, _decryptCipher!.blockSize);
     }
 
     int minPaddingLength;
@@ -1136,7 +1417,7 @@ class SSHTransport {
       throw ArgumentError.value(actualMac, 'mac', 'Invalid MAC size');
     }
 
-    final macType = isClient ? _serverMacType! : _clientMacType!;
+    final macType = _remoteMacType!;
     final isEtm = macType.isEtm;
 
     _remoteMac!.updateAll(_remotePacketSN.value.toUint32());
@@ -1155,11 +1436,7 @@ class SSHTransport {
 
     final expectedMac = _remoteMac!.finish();
 
-    if (!expectedMac.equals(actualMac)) {
-      throw SSHPacketError(
-        'MAC mismatch, expected: $expectedMac, actual: $actualMac',
-      );
-    }
+    if (!expectedMac.equals(actualMac)) throw _damagedPacket();
   }
 
   void _startHandshake() {
@@ -1170,13 +1447,32 @@ class SSHTransport {
     }
   }
 
+  /// Installs the keys of the exchange for what this side sends, and with
+  /// them what the exchange agreed on for that direction: from here on it
+  /// is what protects what goes out ([_localCipherType]). Called when our
+  /// own NEWKEYS has gone out, and nowhere else.
   void _applyLocalKeys() {
     final cipherType = isClient ? _clientCipherType : _serverCipherType;
     if (cipherType == null) throw StateError('No cipher type selected');
+    // A cipher that checks its packets by itself has no MAC beside it.
+    final macType = cipherType.isAead
+        ? null
+        : (isClient ? _clientMacType : _serverMacType);
+    if (!cipherType.isAead && macType == null) {
+      throw StateError('No MAC type selected');
+    }
 
     // Zero old key material before overwriting references (rekey safety).
     if (_localCipherKey != null) zeroBytes(_localCipherKey!);
     if (_localIV != null && _localIV!.isNotEmpty) zeroBytes(_localIV!);
+
+    _localCipherType = cipherType;
+    _localMacType = macType;
+
+    // New keys: what goes out under them is counted from here.
+    _localGcmPackets = 0;
+    _sentPacketsUnderKeys = 0;
+    _sentBytesUnderKeys = 0;
 
     _localCipherKey = _deriveKey(
       isClient ? SSHDeriveKeyType.clientKey : SSHDeriveKeyType.serverKey,
@@ -1187,14 +1483,10 @@ class SSHTransport {
       // ChaCha20-Poly1305 does not use a derived IV; the nonce is the
       // sequence number. The 64-byte key is split internally.
       _localIV = Uint8List(0);
-      _localChaCha = SSHCipherChaCha20Poly1305(key: _localCipherKey!);
       _encryptCipher = null;
       _localMac = null;
       return;
     }
-
-    // Not ChaCha20 -- clear any stale ChaCha instance from a prior cipher.
-    _localChaCha = null;
 
     _localIV = _deriveKey(
       isClient ? SSHDeriveKeyType.clientIV : SSHDeriveKeyType.serverIV,
@@ -1213,20 +1505,28 @@ class SSHTransport {
       forEncryption: true,
     );
 
-    final macType = isClient ? _clientMacType : _serverMacType;
-    if (macType == null) throw StateError('No MAC type selected');
-
     final macKey = _deriveKey(
       isClient ? SSHDeriveKeyType.clientMacKey : SSHDeriveKeyType.serverMacKey,
-      macType.keySize,
+      macType!.keySize,
     );
 
     _localMac = macType.createMac(macKey);
   }
 
+  /// Installs the keys of the exchange for what the other side sends, and
+  /// with them what the exchange agreed on for that direction: from here on
+  /// it is what its packets are read by ([_remoteCipherType]). Called when
+  /// the other side's NEWKEYS has come, and nowhere else.
   void _applyRemoteKeys() {
     final cipherType = isClient ? _serverCipherType : _clientCipherType;
     if (cipherType == null) throw StateError('No cipher type selected');
+    // A cipher that checks its packets by itself has no MAC beside it.
+    final macType = cipherType.isAead
+        ? null
+        : (isClient ? _serverMacType : _clientMacType);
+    if (!cipherType.isAead && macType == null) {
+      throw StateError('No MAC type selected');
+    }
 
     // Rekey opens a fresh key epoch: under strict KEX the receive sequence
     // number restarts at 0 under a brand-new key, so re-arm the ChaCha
@@ -1239,6 +1539,14 @@ class SSHTransport {
     // Zero old key material before overwriting references (rekey safety).
     if (_remoteCipherKey != null) zeroBytes(_remoteCipherKey!);
     if (_remoteIV != null && _remoteIV!.isNotEmpty) zeroBytes(_remoteIV!);
+
+    _remoteCipherType = cipherType;
+    _remoteMacType = macType;
+
+    // New keys: what comes in under them is counted from here.
+    _remoteGcmPackets = 0;
+    _receivedPacketsUnderKeys = 0;
+    _receivedBytesUnderKeys = 0;
 
     _remoteCipherKey = _deriveKey(
       isClient ? SSHDeriveKeyType.serverKey : SSHDeriveKeyType.clientKey,
@@ -1275,12 +1583,9 @@ class SSHTransport {
       forEncryption: false,
     );
 
-    final macType = isClient ? _serverMacType : _clientMacType;
-    if (macType == null) throw StateError('No MAC type selected');
-
     final macKey = _deriveKey(
       isClient ? SSHDeriveKeyType.serverMacKey : SSHDeriveKeyType.clientMacKey,
-      macType.keySize,
+      macType!.keySize,
     );
     _remoteMac = macType.createMac(macKey);
   }
@@ -1315,12 +1620,87 @@ class SSHTransport {
     return writer.takeBytes();
   }
 
+  /// Whether the key the server shows ([keyBytes]) signed this exchange:
+  /// whether [signatureBytes] is its signature of [exchangeHash].
+  ///
+  /// The key has to be of the kind that was agreed on, and its signature of
+  /// the kind of the key. A key that is not, and bytes that are no key or
+  /// no signature, are refused with an [SSHHostkeyError] that says so: a
+  /// host key that cannot be taken is a host key that was refused, whatever
+  /// it failed on, and not a packet that could not be read.
+  /// (A key was read by what was agreed on, with nothing held to it: an
+  /// ECDSA key of another curve was taken, since the three read alike, and
+  /// anything that did not read ended the connection as a "Malformed
+  /// packet". See the changelog, "A host key is of the kind that was agreed
+  /// on".)
   bool _verifyHostkey({
     required Uint8List keyBytes,
     required Uint8List signatureBytes,
     required Uint8List exchangeHash,
   }) {
-    switch (_hostkeyType) {
+    final agreed = _hostkeyType;
+    if (agreed == null) throw StateError('No hostkey type negotiated');
+    try {
+      _requireHostKeyOfTheKindAgreedOn(agreed, keyBytes);
+      return _signedByHostKey(agreed, keyBytes, signatureBytes, exchangeHash);
+    } on SSHHostkeyError catch (e) {
+      // What reads a key does not know which exchange of the connection
+      // this is: that is said here.
+      if (!_hostkeyVerified) rethrow;
+      throw SSHHostkeyError(e.message, fault: e.fault, duringRekey: true);
+    } on SSHError {
+      rethrow;
+    } catch (e) {
+      throw SSHHostkeyError(
+        'The host key or its signature could not be read: '
+        '${_asSaid('$e', 160)}',
+        fault: SSHHostkeyFault.noKey,
+        duringRekey: _hostkeyVerified,
+      );
+    }
+  }
+
+  /// The kind a host key has to be of where [agreed] was agreed on: the
+  /// name of the algorithm itself, which for an RSA key is `ssh-rsa` also
+  /// under the two newer names an RSA signature has.
+  static String _keyKindAgreedOn(SSHHostkeyType agreed) =>
+      agreed == SSHHostkeyType.rsaSha256 || agreed == SSHHostkeyType.rsaSha512
+          ? SSHRsaPublicKey.type
+          : agreed.name;
+
+  /// Refuses a key that says it is of another kind than was agreed on (RFC
+  /// 4253, 7.1: the server shows a key of the algorithm that was chosen).
+  static void _requireHostKeyOfTheKindAgreedOn(
+    SSHHostkeyType agreed,
+    Uint8List keyBytes,
+  ) {
+    final shown = SSHMessageReader(keyBytes).readUtf8();
+    final wanted = _keyKindAgreedOn(agreed);
+    if (shown != wanted) {
+      throw SSHHostkeyError(
+        'The server showed a host key of the kind "${_asSaid(shown, 64)}", '
+        'and "$wanted" was agreed on',
+        fault: SSHHostkeyFault.noKey,
+      );
+    }
+  }
+
+  /// [text] of the other side's own, or made of it, as it goes into an
+  /// error: the characters a name of the protocol can have and a few that
+  /// words have, anything else as a question mark, and no longer than
+  /// [most].
+  static String _asSaid(String text, int most) {
+    final cut = text.length > most ? '${text.substring(0, most)}...' : text;
+    return cut.replaceAll(RegExp(r'[^A-Za-z0-9@._+\-:,()/ ]'), '?');
+  }
+
+  bool _signedByHostKey(
+    SSHHostkeyType agreed,
+    Uint8List keyBytes,
+    Uint8List signatureBytes,
+    Uint8List exchangeHash,
+  ) {
+    switch (agreed) {
       case SSHHostkeyType.ed448:
         final publicKey = SSHEd448PublicKey.decode(keyBytes);
         final signature = SSHEd448Signature.decode(signatureBytes);
@@ -1333,6 +1713,7 @@ class SSHTransport {
       case SSHHostkeyType.rsaSha256:
       case SSHHostkeyType.rsaSha512:
         final publicKey = SSHRsaPublicKey.decode(keyBytes);
+        _requireRsaHostKeyOfASize(publicKey, shortestTaken: algorithms.minRsaHostKeyBits);
         final signature = SSHRsaSignature.decode(signatureBytes);
         // RFC 8332: the signature algorithm MUST match the host-key
         // algorithm negotiated in KEXINIT. Without this check a server can
@@ -1344,12 +1725,13 @@ class SSHTransport {
           SSHHostkeyType.rsaSha256: SSHRsaSignatureType.sha256,
           SSHHostkeyType.rsaSha512: SSHRsaSignatureType.sha512,
         };
-        if (signature.type != expectedSig[_hostkeyType]) {
-          printDebug?.call(
-            'Rejecting host key: RSA signature algorithm "${signature.type}" '
-            'does not match negotiated "${_hostkeyType?.name}" (RFC 8332)',
+        if (signature.type != expectedSig[agreed]) {
+          throw SSHHostkeyError(
+            'The signature of the host key is of the kind '
+            '"${_asSaid(signature.type, 64)}", and "${agreed.name}" was '
+            'agreed on',
+            fault: SSHHostkeyFault.noKey,
           );
-          return false;
         }
         return publicKey.verify(exchangeHash, signature);
       case SSHHostkeyType.ecdsa256:
@@ -1357,11 +1739,95 @@ class SSHTransport {
       case SSHHostkeyType.ecdsa521:
         final publicKey = SSHEcdsaPublicKey.decode(keyBytes);
         final signature = SSHEcdsaSignature.decode(signatureBytes);
+        // The signature says its own kind too, and its key's is the kind
+        // it has to be of: the hash it is checked with goes by the key.
+        if (signature.type != publicKey.type) {
+          throw SSHHostkeyError(
+            'The signature of the host key is of the kind '
+            '"${_asSaid(signature.type, 64)}", and its key is of the kind '
+            '"${publicKey.type}"',
+            fault: SSHHostkeyFault.noKey,
+          );
+        }
         return publicKey.verify(exchangeHash, signature);
-      case null:
-        throw StateError('No hostkey type negotiated');
       default:
-        throw UnimplementedError('Unsupported hostkey type: $_hostkeyType');
+        throw UnimplementedError('Unsupported hostkey type: $agreed');
+    }
+  }
+
+  /// The longest RSA host key that is taken, by its modulus, in bits. No
+  /// server has a longer one, and OpenSSH takes none.
+  static const _maxRsaHostKeyBits = 16384;
+
+  /// The longest public exponent of an RSA host key that is taken, in bits.
+  /// It is 65537 in any key that anybody makes; OpenSSH's library takes none
+  /// of more than 64 bits beside a long modulus.
+  static const _maxRsaHostKeyExponentBits = 64;
+
+  /// Refuses an RSA host key that no server has, before anything is
+  /// computed with it.
+  ///
+  /// The check of a host key's signature raises a number to the key's
+  /// public exponent, modulo the key, and how long that takes is for
+  /// whoever sends the key to choose: with the length of the modulus and
+  /// with the length of the exponent. It is done before anybody is asked
+  /// whether they trust the key, and before the sign-in: whoever stands
+  /// between a client and its server can send a key in the server's place.
+  /// A key of 16384 bits with an exponent as long keeps a desktop's
+  /// processor busy for more than a second, a doubling of both makes that
+  /// eight times as long, and a key in one packet can be eight times as
+  /// long: more than ten minutes in which the program does nothing else.
+  /// (A key of any size was checked until this was held. See the
+  /// changelog, "An RSA host key of a size no key has is refused".)
+  ///
+  /// A key shorter than [shortestTaken] bits is refused here as well, and
+  /// said as what it is: too short, with both lengths, and not as no key.
+  /// Such a key is a key, and what it would take to accept it is for
+  /// whoever connects to say (`SSHAlgorithms.minRsaHostKeyBits`). (A key of
+  /// any length down to what holds a signature was taken until this was
+  /// held. See the changelog, "An RSA host key shorter than 1024 bits is
+  /// refused".)
+  static void _requireRsaHostKeyOfASize(SSHRsaPublicKey key, {required int shortestTaken}) {
+    // (Neither number is below nought: a number is read off the wire as it
+    // stands, with no sign.)
+    final n = key.n;
+    final e = key.e;
+    if (n.isEven) {
+      throw SSHHostkeyError(
+        'The RSA host key has a modulus that is none: it is an even number, '
+        'or nought',
+        fault: SSHHostkeyFault.noKey,
+      );
+    }
+    if (n.bitLength < shortestTaken) {
+      throw SSHHostkeyError(
+        'The RSA host key has a modulus of ${n.bitLength} bits, and none of '
+        'less than $shortestTaken is taken',
+        fault: SSHHostkeyFault.tooShort,
+        bits: n.bitLength,
+        shortestTaken: shortestTaken,
+      );
+    }
+    if (n.bitLength > _maxRsaHostKeyBits) {
+      throw SSHHostkeyError(
+        'The RSA host key has a modulus of ${n.bitLength} bits, and no key '
+        'has one of more than $_maxRsaHostKeyBits',
+        fault: SSHHostkeyFault.noKey,
+      );
+    }
+    if (e.bitLength > _maxRsaHostKeyExponentBits) {
+      throw SSHHostkeyError(
+        'The RSA host key has a public exponent of ${e.bitLength} bits, and '
+        'no key has one of more than $_maxRsaHostKeyExponentBits',
+        fault: SSHHostkeyFault.noKey,
+      );
+    }
+    if (e < BigInt.from(3) || e.isEven) {
+      throw SSHHostkeyError(
+        'The RSA host key has a public exponent that is none ($e): it has '
+        'to be odd, and at least 3',
+        fault: SSHHostkeyFault.noKey,
+      );
     }
   }
 
@@ -1383,6 +1849,10 @@ class SSHTransport {
     // pseudo-algorithm appended to the kexAlgorithms name list.
     final kexNames = algorithms.kex.toNameList();
     if (_isInitialKex && isClient) {
+      // The server is asked to say what it has to say of itself once its
+      // keys are in force (RFC 8308, 2.1): in the first proposal, and in no
+      // later one. What it says then: [_handleMessageExtInfo].
+      kexNames.add('ext-info-c');
       kexNames.add('kex-strict-c-v00@openssh.com');
     }
 
@@ -1428,11 +1898,18 @@ class SSHTransport {
     printTrace?.call('-> $socket: $message');
   }
 
+  /// The shortest group a group exchange asks for and takes: 2048 bits,
+  /// or 1024 where whoever connects has said that an old server may have
+  /// no longer group (`SSHAlgorithms.minDhGroupBits`). The same number goes
+  /// into the request, the check of the group the server names, and the
+  /// exchange hash, which is made of what was asked for.
+  int get _gexShortest => SSHKexDH.shortestAskedFor(algorithms.minDhGroupBits);
+
   void _sendKexDHGexRequest() {
     printDebug?.call('SSHTransport._sendKexDHGexRequest');
 
     final message = SSH_Message_KexDH_GexRequest(
-      minN: SSHKexDH.gexMin,
+      minN: _gexShortest,
       preferredN: SSHKexDH.gexPref,
       maxN: SSHKexDH.gexMax,
     );
@@ -1491,36 +1968,47 @@ class SSHTransport {
     // non-KEX message - between the first KEXINIT and the first NEWKEYS,
     // because permitting them is precisely the packet-injection primitive
     // Terrapin uses to desynchronise the handshake transcript. Allow only
-    // DISCONNECT(1), KEXINIT(20), NEWKEYS(21) and the method-specific KEX
-    // range (30-49); fail closed on anything else. This is stricter than the
-    // generic pre-handshake gate below (which tolerates ids 1-4), and only
-    // applies while strict KEX is active during the initial exchange.
+    // DISCONNECT(1), KEXINIT(20), NEWKEYS(21) and the two numbers a server
+    // answers an exchange under (31: its answer, or the group of a group
+    // exchange; 33: the answer to a group exchange), which the steps of the
+    // exchange hold to their order ([_kexStep]); fail closed on anything
+    // else. (Every number from 30 to 49 was let through, and one that is no
+    // message of the exchange was handed up once the host key had been
+    // looked at.) This is stricter than the generic pre-handshake gate below
+    // (which tolerates ids 1-4), and only applies while strict KEX is active
+    // during the initial exchange.
     if (_serverSupportsStrictKex && _isInitialKex) {
       const disconnectId = 1; // SSH_Message_Disconnect.messageId
       final allowed = messageId == disconnectId ||
           messageId == SSH_Message_KexInit.messageId || // 20
           messageId == SSH_Message_NewKeys.messageId || // 21
-          (messageId >= 30 && messageId <= 49); // method-specific KEX
+          messageId == SSH_Message_KexDH_Reply.messageId || // 31
+          messageId == SSH_Message_KexDH_GexReply.messageId; // 33
       if (!allowed) {
-        closeWithError(SSHHandshakeError(
-          'Strict KEX violation: unexpected message id $messageId during the '
-          'initial key exchange (possible Terrapin attack).',
+        closeWithError(_strictOrderBroken(
+          'unexpected message id $messageId during the initial key exchange',
         ));
         return;
       }
     }
 
     switch (messageId) {
+      case SSH_Message_Disconnect.messageId:
+        return _handleMessageDisconnect(message);
       case SSH_Message_KexInit.messageId:
         return _handleMessageKexInit(message);
       case SSH_Message_KexDH_Reply.messageId:
       case SSH_Message_KexDH_GexReply.messageId:
-        return _handleMessageKexReply(message);
+        return _handleMessageKexReply(message, messageId);
       case SSH_Message_NewKeys.messageId:
         return _handleMessageNewKeys(message);
+      case SSH_Message_ExtInfo.messageId when _remoteUnderKeys:
+        return _handleMessageExtInfo(message);
       default:
         // SECURITY: do not hand post-KEX messages to the connection layer
-        // until the host key has been verified.
+        // until what the other side sends is its own ([_remoteIsItself]):
+        // under keys, and on a client those of a host key that was
+        // verified.
         //
         // Host-key verification is ASYNCHRONOUS - `onVerifyHostKey` shows
         // the user a "this host is unknown / has changed, accept?" prompt
@@ -1532,12 +2020,22 @@ class SSHTransport {
         // before the user had accepted the key, and before any cipher was
         // installed, i.e. in cleartext straight to the attacker.
         //
+        // The approval alone is not enough: until the server's first
+        // NEWKEYS what arrives comes in the clear, and anybody on the way
+        // can have written it. Where no strict key exchange was agreed (the
+        // gate above), a SERVICE_ACCEPT and a USERAUTH_SUCCESS in the clear
+        // were handed up once the key was approved, and whoever sat between
+        // could play the client a session it took for the server's.
+        //
         // Anything legal this early is handled above or allowed through
         // here; everything else is a protocol violation and we fail closed.
-        if (!_hostkeyVerified && messageId > _maxPreHandshakeMessageId) {
+        if (!_remoteIsItself && messageId > _maxPreHandshakeMessageId) {
           closeWithError(SSHStateError(
-            'Server sent message id $messageId before host-key verification '
-            'completed - refusing to continue.',
+            _hostkeyVerified
+                ? 'Server sent message id $messageId in the clear, before its '
+                    'NEWKEYS - refusing to continue.'
+                : 'Server sent message id $messageId before host-key verification '
+                    'completed - refusing to continue.',
           ));
           return;
         }
@@ -1545,8 +2043,93 @@ class SSHTransport {
     }
   }
 
+  /// What ends a connection whose server broke the order of the strict
+  /// key exchange ([SSHHandshakeError.strictOrderBroken]), with [what] it
+  /// was.
+  static SSHHandshakeError _strictOrderBroken(String what) => SSHHandshakeError(
+        'Strict KEX violation: $what (possible Terrapin attack).',
+        strictOrderBroken: true,
+      );
+
+  /// What ends a key exchange whose two sides have no algorithm of one
+  /// [kind] in common, with what each side offered of it
+  /// ([SSHHandshakeError.offered], [SSHHandshakeError.otherSideOffered]):
+  /// [mine] as this side offered them, and [theirs] as the other side's
+  /// proposal names them, without the marks that are no algorithms
+  /// ([_proposalMarks]). (Nothing said what either side had offered: whoever
+  /// read the error had to ask the other side with another program.)
+  static SSHHandshakeError _nothingInCommon(String kind, List<SSHAlgorithm> mine, List<String> theirs) =>
+      SSHHandshakeError(
+        'No matching $kind algorithm',
+        offered: List.unmodifiable(mine.toNameList()),
+        otherSideOffered: List.unmodifiable(theirs.where((name) => !_proposalMarks.contains(name))),
+      );
+
+  /// What a proposal names among its key exchanges that is no key exchange:
+  /// the mark of the strict exchange and the request to be told the
+  /// extensions, each as a client and as a server names it.
+  static const _proposalMarks = {
+    'ext-info-c',
+    'ext-info-s',
+    'kex-strict-c-v00@openssh.com',
+    'kex-strict-s-v00@openssh.com',
+  };
+
+  /// The other side ends the connection, and says why. That is how the
+  /// connection ends for whoever holds it: with what was said, and with
+  /// whether it is the other side's own ([_remoteIsItself]): this message
+  /// may come at any time, before any keys as well.
+  /// (The message was handed on and dropped unread; the connection then
+  /// ended with the socket, and nothing said why.)
+  void _handleMessageDisconnect(Uint8List payload) {
+    final message = SSH_Message_Disconnect.decode(payload);
+    printTrace?.call('<- $socket: $message');
+    closeWithError(SSHDisconnectError(
+      message.reasonCode,
+      message.description,
+      authentic: _remoteIsItself,
+    ));
+  }
+
+  /// What the server says of itself (SSH_MSG_EXT_INFO, RFC 8308): kept for
+  /// whoever signs in, and handed to nobody.
+  ///
+  /// It is taken under the server's keys, and from nobody before those. It
+  /// comes right after the server's first NEWKEYS, which is while the host
+  /// key may still be looked at: it is kept, and nothing is done with it
+  /// until that key is approved, since nothing signs in before. Where a
+  /// server says it again, what it says last holds (RFC 8308, 2.4).
+  ///
+  /// (The client did not ask, so no server said it, and an RSA key signed
+  /// in one way whatever a server takes. Had a server said it, the
+  /// connection would have ended where it came before the host key was
+  /// approved, as a message with no business there, and it would have been
+  /// handed up and dropped where it came after.)
+  void _handleMessageExtInfo(Uint8List payload) {
+    final message = SSH_Message_ExtInfo.decode(payload);
+    printTrace?.call('<- $socket: $message');
+    final takes = message.serverSignatureAlgorithms;
+    _serverExtensions = List.unmodifiable(message.names);
+    _serverSignatureAlgorithms = takes == null ? null : List.unmodifiable(takes);
+    printDebug?.call(
+      'SSHTransport: the server says of itself: ${_serverExtensions.join(', ')}'
+      '${takes == null ? '' : '; signatures it takes: ${takes.join(', ')}'}',
+    );
+    onExtInfo?.call();
+  }
+
   void _handleMessageKexInit(Uint8List payload) {
     printDebug?.call('SSHTransport._handleMessageKexInit');
+
+    // One proposal to an exchange, and the next exchange only once this one
+    // is over on both sides (see [_kexStep]).
+    if (isClient && (_kexStep != _KexStep.idle || _localNewKeysOwed)) {
+      closeWithError(SSHHandshakeError(
+        'The server sent a key exchange proposal while an exchange was still '
+        'in progress.',
+      ));
+      return;
+    }
 
     // If this message initiates a new key-exchange round from the remote
     // side, we MUST respond with our own KEXINIT (RFC 4253 §7.1).
@@ -1570,6 +2153,18 @@ class SSHTransport {
           .contains('kex-strict-s-v00@openssh.com');
       if (_serverSupportsStrictKex) {
         printDebug?.call('SSHTransport: server supports strict KEX (Terrapin mitigation)');
+        // Under the strict exchange the proposal is the first packet a
+        // server sends. Whether the exchange is strict is known only now,
+        // so what came before the proposal was taken as it came (a message
+        // that may come at any time: IGNORE, DEBUG, UNIMPLEMENTED), and is
+        // counted here: the packets of the other side are numbered from
+        // nought, and this one is not the first.
+        if (_remotePacketSN.value != 0) {
+          closeWithError(_strictOrderBroken(
+            'the server\'s key exchange proposal was not the first packet it sent',
+          ));
+          return;
+        }
       }
     }
 
@@ -1605,22 +2200,22 @@ class SSHTransport {
     );
 
     if (_kexType == null) {
-      throw SSHHandshakeError('No matching key exchange algorithm');
+      throw _nothingInCommon('key exchange', algorithms.kex, message.kexAlgorithms);
     }
     if (_hostkeyType == null) {
-      throw SSHHandshakeError('No matching host key algorithm');
+      throw _nothingInCommon('host key', algorithms.hostkey, message.serverHostKeyAlgorithms);
     }
     if (_clientCipherType == null) {
-      throw SSHHandshakeError('No matching client cipher algorithm');
+      throw _nothingInCommon('client cipher', algorithms.cipher, message.encryptionClientToServer);
     }
     if (_serverCipherType == null) {
-      throw SSHHandshakeError('No matching server cipher algorithm');
+      throw _nothingInCommon('server cipher', algorithms.cipher, message.encryptionServerToClient);
     }
     if (_clientMacType == null && !_clientCipherType!.isAead) {
-      throw SSHHandshakeError('No matching client MAC algorithm');
+      throw _nothingInCommon('client MAC', algorithms.mac, message.macClientToServer);
     }
     if (_serverMacType == null && !_serverCipherType!.isAead) {
-      throw SSHHandshakeError('No matching server MAC algorithm');
+      throw _nothingInCommon('server MAC', algorithms.mac, message.macServerToClient);
     }
 
     printDebug?.call('SSHTransport._kexType: $_kexType');
@@ -1633,10 +2228,18 @@ class SSHTransport {
     _kexStartTime = DateTime.now();
     onKexNegotiated?.call(
       kex: _kexType!.name,
-      cipher: _clientCipherType?.name ?? 'none',
-      mac: _clientMacType?.name ?? 'none',
+      cipher: _clientCipherType!.name,
+      // A cipher that checks its packets by itself has no MAC beside it,
+      // whatever the two proposals named for one (and they always name one).
+      mac: _clientCipherType!.isAead ? '' : _clientMacType!.name,
       hostKey: _hostkeyType!.name,
     );
+
+    if (isClient) {
+      _kexStep = _kexType!.isGroupExchange
+          ? _KexStep.awaitingGroup
+          : _KexStep.awaitingAnswer;
+    }
 
     switch (_kexType) {
       case SSHKexType.mlkem768x25519:
@@ -1682,23 +2285,40 @@ class SSHTransport {
   /// When client receives [SSH_Message_KexECDH_Reply], it should verify the
   /// server's signature with the server's public key. Then send NEW_KEYS
   /// message back to the server.
-  void _handleMessageKexReply(Uint8List payload) {
+  void _handleMessageKexReply(Uint8List payload, int messageId) {
     printDebug?.call('SSHTransport._handleMessageKexReply');
     if (isServer) throw SSHStateError('Unexpected KEX_REPLY');
 
-    final kex = _kex;
     final kexType = _kexType;
 
     if (kexType == null) {
       throw SSHStateError('kexType has not been negotiated');
     }
 
+    // The answer is taken once, and only when it is the server's turn to
+    // give it (see [_kexStep]). In a group exchange the group comes first,
+    // under the number an answer has elsewhere.
+    if (_kexStep == _KexStep.awaitingGroup &&
+        messageId == SSH_Message_KexDH_GexGroup.messageId) {
+      _kexStep = _KexStep.awaitingAnswer;
+      return _handleMessageKexGexReply(payload);
+    }
+    final answerId = kexType.isGroupExchange
+        ? SSH_Message_KexDH_GexReply.messageId
+        : SSH_Message_KexDH_Reply.messageId;
+    if (_kexStep != _KexStep.awaitingAnswer || messageId != answerId) {
+      closeWithError(SSHHandshakeError(
+        'The server sent an answer to the key exchange (message $messageId) '
+        'that was not asked for: an exchange has one answer.',
+      ));
+      return;
+    }
+    _kexStep = _KexStep.awaitingNewKeys;
+    _localNewKeysOwed = true;
+
+    final kex = _kex;
     if (kex == null) {
-      if (kexType.isGroupExchange == true) {
-        return _handleMessageKexGexReply(payload);
-      } else {
-        throw SSHStateError('No key exchange algorithm');
-      }
+      throw SSHStateError('No key exchange algorithm');
     }
 
     late Uint8List hostkey;
@@ -1745,6 +2365,7 @@ class SSHTransport {
     final exchangeHash = SSHKexUtils.computeExchangeHash(
       digest: _kexType!.createDigest(),
       groupExchange: kexType.isGroupExchange ? kex as SSHKexDH : null,
+      groupExchangeShortest: _gexShortest,
       clientVersion: _localVersion,
       serverVersion: _remoteVersion!,
       clientKexInit: _localKexInit,
@@ -1761,7 +2382,13 @@ class SSHTransport {
         signatureBytes: hostSignature,
         exchangeHash: exchangeHash,
       );
-      if (!verified) throw SSHHostkeyError('Signature verification failed');
+      if (!verified) {
+        throw SSHHostkeyError(
+          'Signature verification failed',
+          fault: SSHHostkeyFault.notSigned,
+          duringRekey: _hostkeyVerified,
+        );
+      }
     }
 
     // Re-key host-key pinning: after the initial exchange the server's host
@@ -1772,7 +2399,11 @@ class SSHTransport {
     // it is the SAME key the user already trusted; this closes that gap.
     final pinnedHostKey = _verifiedHostKey;
     if (pinnedHostKey != null && !_hostKeyBytesEqual(pinnedHostKey, hostkey)) {
-      closeWithError(SSHHostkeyError('Host key changed during re-key'));
+      closeWithError(SSHHostkeyError(
+        'Host key changed during re-key',
+        fault: SSHHostkeyFault.changed,
+        duringRekey: true,
+      ));
       return;
     }
 
@@ -1789,8 +2420,7 @@ class SSHTransport {
     onHostKeyReceived?.call(_hostkeyType!.name, fingerprintHex);
 
     if (_hostkeyVerified) {
-      _sendNewKeys();
-      _applyLocalKeys();
+      _finishExchange(exchangeHash, sharedSecret);
       return;
     }
 
@@ -1802,21 +2432,78 @@ class SSHTransport {
 
     Future.value(userVerified).then(
       (verified) {
+        // The connection may have ended while the person was asked: there is
+        // nothing left to finish, and nothing to send into.
+        if (isClosed) return;
         if (!verified) {
           closeWithError(SSHHostkeyError('Hostkey verification failed'));
-        } else {
+        } else if (_exchangeIs(exchangeHash, sharedSecret)) {
           _hostkeyVerified = true;
           // Pin the accepted key so every later re-key is checked against it.
           _verifiedHostKey = Uint8List.fromList(hostkey);
-          _sendNewKeys();
-          _applyLocalKeys();
-          onReady?.call();
+          // What is thrown from here on ends the connection. This runs by
+          // itself, long after the server's answer was read where a person
+          // was asked about the key, and nobody else is there to catch it:
+          // our NEWKEYS failing to go out on a socket that has gone, or
+          // whoever holds the connection failing at its first request. (It
+          // was thrown into nowhere, with the connection left open and
+          // whoever waited for the sign-in waiting until their own patience
+          // ran out.)
+          try {
+            _finishExchange(exchangeHash, sharedSecret);
+            onReady?.call();
+          } catch (error, stackTrace) {
+            closeWithError(
+              error is SSHError
+                  ? error
+                  : SSHStateError('The connection could not be made ready once its host key was approved: $error'),
+              stackTrace,
+            );
+          }
+        } else {
+          closeWithError(SSHStateError(
+            'The key exchange changed while its host key was being verified.',
+          ));
         }
       },
-      onError: (error) {
-        closeWithError(error);
+      onError: (Object error, StackTrace stackTrace) {
+        if (isClosed) return;
+        // Whatever the lookup failed with, the key was not verified. An
+        // error of another kind than ours went to [closeWithError] as it
+        // was until this was held, which is a type error there: thrown into
+        // nowhere, with the connection left open and waiting for ever.
+        closeWithError(
+          error is SSHError
+              ? error
+              : SSHHostkeyError('The host key could not be verified: $error'),
+          stackTrace,
+        );
       },
     );
+  }
+
+  /// Whether the exchange waiting for our NEWKEYS is still the one that
+  /// produced [exchangeHash] and [sharedSecret].
+  bool _exchangeIs(Uint8List exchangeHash, Uint8List sharedSecret) =>
+      _localNewKeysOwed &&
+      identical(_exchangeHash, exchangeHash) &&
+      identical(_sharedSecret, sharedSecret);
+
+  /// Sends our NEWKEYS and puts our keys of the exchange in force: those
+  /// that follow from [exchangeHash] and [sharedSecret], the answer whose
+  /// host key was approved. With anything else in their place the connection
+  /// ends (it cannot happen while an exchange takes one answer; this is the
+  /// second lock on that door).
+  void _finishExchange(Uint8List exchangeHash, Uint8List sharedSecret) {
+    if (!_exchangeIs(exchangeHash, sharedSecret)) {
+      closeWithError(SSHStateError(
+        'The key exchange changed while its host key was being verified.',
+      ));
+      return;
+    }
+    _localNewKeysOwed = false;
+    _sendNewKeys();
+    _applyLocalKeys();
   }
 
   void _handleMessageKexGexReply(Uint8List payload) {
@@ -1826,17 +2513,15 @@ class SSHTransport {
     final message = SSH_Message_KexDH_GexGroup.decode(payload);
     printTrace?.call('<- $socket: $message');
 
-    // Validate the server-chosen prime size (RFC 4419). Without this a
-    // malicious server could pick a tiny, easily-broken modulus and
-    // downgrade the DH strength while we believe we negotiated a strong
-    // group. Enforce the same [min, max] window the client requested.
-    final pBits = message.p.bitLength;
-    if (pBits < SSHKexDH.gexMin || pBits > SSHKexDH.gexMax) {
-      // SSHStateError (an SSHError) so `on SSHError` handles the teardown
-      // cleanly, rather than a FormatException leaking to the zone.
-      throw SSHStateError('DH group-exchange prime size $pBits bits out of '
-          'range [${SSHKexDH.gexMin}, ${SSHKexDH.gexMax}]');
-    }
+    // The group the server chose is one that can be used (RFC 4419), or
+    // the connection ends here: of the length that was asked for, with a
+    // generator that is one. A server could name a group that is easily
+    // broken while its client believes it has a strong one. (What is
+    // thrown is an SSHError, so the connection ends in order.)
+    SSHKexDH.requireGroupOfAnExchange(message.p, message.g, shortest: _gexShortest);
+    // How long it is: what the session's secrecy rests on, and nothing of
+    // the group itself.
+    printDebug?.call('SSHTransport: the server named a group of ${message.p.bitLength} bits for the key exchange');
 
     _kex = SSHKexDH(p: message.p, g: message.g, secretBits: 256);
     _sendKexDHGexInit();
@@ -1845,6 +2530,19 @@ class SSHTransport {
   void _handleMessageNewKeys(Uint8List message) {
     printDebug?.call('SSHTransport._handleMessageNewKeys');
     printTrace?.call('<- $socket: SSH_Message_NewKeys');
+
+    // NEWKEYS ends an exchange whose answer was taken (see [_kexStep]):
+    // without one there are no new keys to take, and a second NEWKEYS has
+    // nothing to follow.
+    if (isClient) {
+      if (_kexStep != _KexStep.awaitingNewKeys) {
+        closeWithError(SSHHandshakeError(
+          'The server sent NEWKEYS without an answer to a key exchange.',
+        ));
+        return;
+      }
+      _kexStep = _KexStep.idle;
+    }
 
     _applyRemoteKeys();
 
@@ -1896,7 +2594,11 @@ class SSHTransport {
   /// by client code to refresh session keys when needed.
   void rekey() {
     printDebug?.call('SSHTransport.rekey');
-    if (_kexInProgress) {
+    // Not while an exchange is in progress, and not before our NEWKEYS for
+    // the last one is out: with the server's NEWKEYS in and the host key
+    // still being looked at, a proposal from here would go out in the clear,
+    // ahead of the NEWKEYS it has to follow.
+    if (_kexInProgress || _localNewKeysOwed) {
       printDebug
           ?.call('Key exchange already in progress, ignoring rekey request');
       return;
@@ -1934,4 +2636,20 @@ class SSHTransport {
     final messageId = data[0];
     return (messageId >= 20 && messageId <= 49) || messageId <= 4;
   }
+}
+
+/// What the server may send next for the key exchange in progress, see
+/// [SSHTransport._kexStep].
+enum _KexStep {
+  /// No exchange in progress: the server may open one with its proposal.
+  idle,
+
+  /// A group exchange was agreed on: the group is awaited.
+  awaitingGroup,
+
+  /// The answer to the exchange is awaited.
+  awaitingAnswer,
+
+  /// The answer was taken: the server's NEWKEYS is awaited.
+  awaitingNewKeys,
 }

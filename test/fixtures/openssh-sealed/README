@@ -1,0 +1,12 @@
+Made with OpenSSH_10.2p1's ssh-keygen (Ubuntu, WSL), 22 October 2026, for
+test/src/ssh_key_file_test.dart:
+
+  ssh-keygen -t ed25519 -N 'correct horse battery' -C 'kat ed25519' -f ed25519
+  ssh-keygen -t ecdsa -b 256 -N 'p256 pass' -C 'kat ecdsa' -f ecdsa256
+  ssh-keygen -t rsa -b 2048 -N 'rsa pass' -C 'kat rsa' -f rsa2048
+  ssh-keygen -t ed25519 -a 4 -N 'four rounds' -C 'kat rounds' -f ed25519_a4
+  ssh-keygen -t ed25519 -N '' -C 'kat plain' -f plain
+  cp plain plain_then_pass; ssh-keygen -p -P '' -N 'added later' -f plain_then_pass
+
+Each *.passphrase holds the passphrase of the file of its name. Test keys
+only: they sign in nowhere.

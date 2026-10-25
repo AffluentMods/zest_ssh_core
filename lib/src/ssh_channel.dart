@@ -4,6 +4,7 @@ import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:zest_ssh_core/src/ssh_channel_id.dart';
+import 'package:zest_ssh_core/src/ssh_errors.dart';
 import 'package:zest_ssh_core/src/ssh_transport.dart';
 import 'package:zest_ssh_core/src/utils/async_queue.dart';
 import 'package:zest_ssh_core/src/message/msg_channel.dart';
@@ -64,8 +65,12 @@ class SSHChannelController {
   /// Remaining remote receive window size.
   late var _remoteWindow = remoteInitialWindowSize;
 
-  /// A [StreamController] that receives data from the remote side.
+  /// A [StreamController] that receives data from the remote side. While
+  /// nobody reads it (not yet, or not for the moment) the window is left
+  /// where it is, so that no more than a window's worth waits here; it is
+  /// opened again when a reader begins, and when one comes back.
   late final _remoteStream = StreamController<SSHChannelData>(
+    onListen: _sendWindowAdjustIfNeeded,
     onResume: _sendWindowAdjustIfNeeded,
   );
 
@@ -88,15 +93,41 @@ class SSHChannelController {
 
   final _done = Completer<void>();
 
+  /// What ended the channel, where that was the end of its connection.
+  Object? _endedBecause;
+
+  /// Sends [request], which asks for a reply, and waits for that reply. On a
+  /// channel that has ended nothing is sent (the id may be another
+  /// channel's by now) and the wait fails at once; a request still waiting
+  /// when the channel ends fails then, where it used to wait for ever.
+  Future<bool> _ask(SSH_Message_Channel_Request request) async {
+    if (_done.isCompleted) {
+      throw _endedBecause ?? SSHStateError('Channel is closed');
+    }
+    sendMessage(request);
+    return await _requestReplyQueue.next;
+  }
+
+  /// The channel has ended: no reply will come for a request that still
+  /// waits for one. Such a request fails with [because] where the channel
+  /// ended with its connection (what ended that), and otherwise as a request
+  /// the server did not grant: it closed the channel instead of answering.
+  void _finish([Object? because]) {
+    _endedBecause = because;
+    _done.complete();
+    _requestReplyQueue.close(
+      because ?? SSHChannelRequestError('The channel closed before the request was answered'),
+    );
+  }
+
   Future<bool> sendExec(String command) async {
-    sendMessage(
+    return _ask(
       SSH_Message_Channel_Request.exec(
         recipientChannel: remoteId,
         wantReply: true,
         command: command,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
   Future<bool> sendPtyReq({
@@ -107,7 +138,7 @@ class SSHChannelController {
     int terminalPixelHeight = 0,
     Uint8List? terminalModes,
   }) async {
-    sendMessage(
+    return _ask(
       SSH_Message_Channel_Request.pty(
         recipientChannel: remoteId,
         termType: terminalType,
@@ -119,17 +150,15 @@ class SSHChannelController {
         wantReply: true,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
   Future<bool> sendShell() async {
-    sendMessage(
+    return _ask(
       SSH_Message_Channel_Request.shell(
         recipientChannel: remoteId,
         wantReply: true,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
   Future<bool> sendX11Req({
@@ -138,43 +167,40 @@ class SSHChannelController {
     required String authenticationCookie,
     int screenNumber = 0,
   }) async {
-    sendMessage(
+    return _ask(
       SSH_Message_Channel_Request.x11(
         recipientChannel: remoteId,
         wantReply: true,
         singleConnection: singleConnection,
         x11AuthenticationProtocol: authenticationProtocol,
         x11AuthenticationCookie: authenticationCookie,
-        x11ScreenNumber: screenNumber.toString(),
+        x11ScreenNumber: screenNumber,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
   Future<bool> sendAgentForwardingRequest() async {
-    sendMessage(
+    return _ask(
       SSH_Message_Channel_Request(
         recipientChannel: remoteId,
         requestType: SSHChannelRequestType.authAgent,
         wantReply: true,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
   Future<bool> sendSubsystem(String subsystem) async {
-    sendMessage(
+    return _ask(
       SSH_Message_Channel_Request.subsystem(
         recipientChannel: remoteId,
         subsystemName: subsystem,
         wantReply: true,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
   Future<bool> sendEnv(String name, String value) async {
-    sendMessage(
+    return _ask(
       SSH_Message_Channel_Request.env(
         recipientChannel: remoteId,
         variableName: name,
@@ -182,7 +208,6 @@ class SSHChannelController {
         wantReply: true,
       ),
     );
-    return await _requestReplyQueue.next;
   }
 
   void sendSignal(String signal) {
@@ -243,7 +268,7 @@ class SSHChannelController {
 
     if (_remoteStream.isClosed) {
       _sendCloseIfNeeded();
-      _done.complete();
+      _finish();
       return;
     }
 
@@ -252,14 +277,16 @@ class SSHChannelController {
 
   /// Closes the channel immediately in both directions. This may send a close
   /// message to the remote side. After this no more data can be sent or
-  /// received.
-  void destroy() {
+  /// received. [because] is what ended the connection, where that is why the
+  /// channel ends: a request of the channel's that still waits for its reply
+  /// fails with it.
+  void destroy([Object? because]) {
     if (_done.isCompleted) return;
     _remoteStream.close();
     _locaStreamConsumer.cancel();
     _sendEOFIfNeeded();
     _sendCloseIfNeeded();
-    _done.complete();
+    _finish(because);
   }
 
   void _handleWindowAdjustMessage(int bytesToAdd) {
@@ -377,9 +404,12 @@ class SSHChannelController {
 
     if (_done.isCompleted) return;
     if (_remoteStream.isPaused) return;
-    if (_localWindow <= 0) return;
 
+    // By as much as has come since it was last opened. (A window that was
+    // used up to its last byte was left as it was here: nothing more could
+    // come then, and the channel stood still for good.)
     final bytesToAdd = localInitialWindowSize - _localWindow;
+    if (bytesToAdd <= 0) return;
     _localWindow = localInitialWindowSize;
 
     sendMessage(
@@ -483,8 +513,9 @@ class SSHChannel {
   /// The channel id on the local side.
   SSHChannelId get channelId => _controller.localId;
 
-  /// The channel id on the remote side.
-  SSHChannelId get remoteChannelId => _controller.localId;
+  /// The channel id on the remote side. (It gave the local one: a channel
+  /// said its own number twice, here and in what it prints.)
+  SSHChannelId get remoteChannelId => _controller.remoteId;
 
   /// The maximum packet size that the remote side can receive.
   int get maximumPacketSize => _controller.remoteMaximumPacketSize;
@@ -497,6 +528,11 @@ class SSHChannel {
   StreamSink<SSHChannelData> get sink => _controller._localStream.sink;
 
   Future<void> get done => _controller._done.future;
+
+  /// What ended the channel, where that was the end of its connection (what
+  /// the connection ended with); null while the channel is open, and for a
+  /// channel that was closed while its connection went on.
+  Object? get endedBecause => _controller._endedBecause;
 
   SSHChannel(this._controller);
 

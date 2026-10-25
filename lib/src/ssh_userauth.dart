@@ -44,7 +44,7 @@ class SSHUserInfoPrompt {
   final bool echo;
 
   @override
-  String toString() => '$runtimeType(prompt: $promptText, echo: $echo)';
+  String toString() => 'SSHUserInfoPrompt(prompt: $promptText, echo: $echo)';
 }
 
 class SSHChangePasswordResponse {

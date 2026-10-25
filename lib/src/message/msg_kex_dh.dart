@@ -152,7 +152,7 @@ class SSH_Message_KexDH_GexGroup extends SSHMessage {
 
   @override
   String toString() {
-    return '$runtimeType(p: $p, g: $g)';
+    return 'SSH_Message_KexDH_GexGroup(p: $p, g: $g)';
   }
 }
 
@@ -231,6 +231,6 @@ class SSH_Message_KexDH_GexReply implements SSH_Message_KexDH_Reply {
 
   @override
   String toString() {
-    return '$runtimeType(hostPublicKey: $hostPublicKey, f: $f, signature: $signature)';
+    return 'SSH_Message_KexDH_GexReply(hostPublicKey: $hostPublicKey, f: $f, signature: $signature)';
   }
 }

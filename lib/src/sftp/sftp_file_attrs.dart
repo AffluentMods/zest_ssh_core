@@ -150,7 +150,7 @@ class SftpFileMode {
 
   @override
   String toString() {
-    return '$runtimeType(${value.toOctal()})';
+    return 'SftpFileMode(${value.toOctal()})';
   }
 }
 

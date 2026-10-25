@@ -68,6 +68,43 @@ Uint8List encodeBigInt(BigInt? number) {
   return result;
 }
 
+/// [base] to the power of [exponent], modulo [modulus], by squaring and
+/// multiplying, with nothing of a big number but `*` and `%`.
+///
+/// This is what `BigInt.modPow` is for, and it is not used: in the Dart SDK
+/// (3.10.8 on x64, as a script and compiled) it answers wrong for some
+/// numbers. Not for numbers picked at random; but for any odd modulus of
+/// 192 bits or more there are bases, which anybody can compute from the
+/// modulus, whose powers it gets wrong, and the numbers of a key exchange
+/// and the signature that is checked are the other side's to pick. `*` and
+/// `%` were right for every number they were tried with.
+///
+/// The exponent must not be negative and the modulus must be positive, as
+/// for `BigInt.modPow`. A group of 2048 bits to a power of 256 bits takes
+/// under a millisecond this way on a desktop, and one of 8192 bits about
+/// ten (measured; half as much again as `BigInt.modPow`). How long it takes
+/// goes by the bits of the exponent, as it does for `BigInt.modPow`: an
+/// exponent that is a secret is for one exchange and no more, which is how
+/// a key exchange uses it.
+@internal
+BigInt modPowExact(BigInt base, BigInt exponent, BigInt modulus) {
+  if (exponent.isNegative) {
+    throw ArgumentError.value(exponent, 'exponent', 'must not be negative');
+  }
+  if (modulus <= BigInt.zero) {
+    throw ArgumentError.value(modulus, 'modulus', 'must be positive');
+  }
+  var result = BigInt.one;
+  // From the highest bit down: square, and multiply where the bit is set.
+  // (There is one bit at the least, so what comes out is below the modulus.)
+  final bits = exponent.toRadixString(2);
+  for (var i = 0; i < bits.length; i++) {
+    result = (result * result) % modulus;
+    if (bits.codeUnitAt(i) == 0x31) result = (result * base) % modulus;
+  }
+  return result;
+}
+
 /// Encode as Big Endian unsigned byte array.
 @internal
 Uint8List encodeBigIntAsUnsigned(BigInt number) {

@@ -82,6 +82,14 @@ class SSHForwardChannel implements SSHSocket {
   void destroy() {
     _channel.destroy();
   }
+
+  /// What a client that is connected through it calls its line, in its
+  /// debug lines and its trace (as a native socket says its address). It
+  /// wrote none, so such a line said "Instance of" and the name the program
+  /// has for this type, which is another one in a program built with its
+  /// names obfuscated.
+  @override
+  String toString() => 'SSHForwardChannel($_channel)';
 }
 
 class SSHX11Channel extends SSHForwardChannel {

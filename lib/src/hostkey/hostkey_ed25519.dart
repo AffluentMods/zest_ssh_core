@@ -17,6 +17,11 @@ class SSHEd25519PublicKey implements SSHHostKey {
       throw Exception('Invalid key type: $type');
     }
     final key = reader.readString();
+    if (key.length != 32) {
+      throw FormatException(
+        'Invalid Ed25519 public key size: ${key.length} bytes (expected 32)',
+      );
+    }
     return SSHEd25519PublicKey(key);
   }
 
@@ -28,13 +33,21 @@ class SSHEd25519PublicKey implements SSHHostKey {
     return writer.takeBytes();
   }
 
-  /// Verifies Ed25519 [signature] on [message] with private key matching [publicKey].
+  /// Whether [signature] is this key's own signature of [message].
+  ///
+  /// False for one that is not, of whatever length. (The library that
+  /// checks it says so by throwing, and never answers no: a signature that
+  /// did not fit ended a connection as a packet that could not be read, and
+  /// not as a host key that had not signed.)
   bool verify(Uint8List message, SSHEd25519Signature signature) {
-    // tweetnacl.Signature(publicKey.key!, null).detached_verify(message, signature.sig!);
-    return VerifyKey(key).verify(
-      signature: Signature(signature.signature),
-      message: message,
-    );
+    try {
+      return VerifyKey(key).verify(
+        signature: Signature(signature.signature),
+        message: message,
+      );
+    } on Exception {
+      return false;
+    }
   }
 
   @override

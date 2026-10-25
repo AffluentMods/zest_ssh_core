@@ -15,4 +15,7 @@ class SSHHostkeyType extends SSHAlgorithm {
   /// The name of the algorithm. For example, `"ssh-rsa`"`.
   @override
   final String name;
+
+  @override
+  String get typeName => 'SSHHostkeyType';
 }

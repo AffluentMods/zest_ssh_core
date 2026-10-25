@@ -26,8 +26,12 @@ class SSH_Message_Disconnect extends SSHMessage {
     final reader = SSHMessageReader(bytes);
     reader.skip(1);
     final reasonCode = reader.readUint32();
-    final description = reader.readUtf8();
-    final language = reader.readUtf8();
+    // Why the other side ends the connection, in its words: read as far as
+    // it can be.
+    final description = reader.readUtf8(allowMalformed: true);
+    // Some servers leave the language tag out, and nothing needs it: it is
+    // read where it is there (OpenSSH's own client does not read it at all).
+    final language = reader.isDone ? '' : reader.readUtf8(allowMalformed: true);
     return SSH_Message_Disconnect(
       reasonCode: reasonCode,
       description: description,

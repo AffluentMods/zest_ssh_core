@@ -24,6 +24,29 @@ class SftpAbortError implements SftpError {
   }
 }
 
+/// What the server sent first is no SFTP. Most often it is text: something
+/// the account's shell prints when a session starts (a line in a start-up
+/// file), which comes down the channel ahead of the SFTP server's first
+/// packet. OpenSSH's own client says "Received message too long" of it. The
+/// session is over when this is thrown.
+class SftpNotSftpError implements SftpError {
+  /// The start of what came, as far as it reads as text: its first line, at
+  /// most eighty characters.
+  final String received;
+
+  SftpNotSftpError(this.received);
+
+  @override
+  String get message =>
+      'The server sent something that is no SFTP where its SFTP server was to answer '
+      '(most often text the shell of the account prints when a session starts): "$received"';
+
+  @override
+  String toString() {
+    return 'SftpNotSftpError: $message';
+  }
+}
+
 class SftpStatusError implements SftpError {
   final int code;
 

@@ -9,9 +9,75 @@ import 'package:zest_ssh_core/src/utils/list.dart';
 /// cannot be determined by either party alone.
 /// https://tools.ietf.org/html/rfc4253#section-8
 class SSHKexDH implements SSHKex {
-  static const gexMin = 1024;
-  static const gexPref = 2048;
+  /// The shortest group that is asked for in a group exchange, and taken,
+  /// in bits. A group of 1024 bits, which was the least here, can be broken
+  /// by whoever has the means, and with it everything that was recorded of
+  /// the sessions under it; OpenSSH takes none under 2048 either.
+  static const gexMin = 2048;
+
+  /// The shortest group that is asked for and taken where whoever connects
+  /// has said that an old server may have one that short
+  /// (`SSHAlgorithms.minDhGroupBits`): 1024 bits, the least RFC 4419 lets
+  /// a client ask for. An old OpenSSH, or a device whose SSH server cannot
+  /// be updated, may have no longer group. Nothing shorter is ever taken.
+  static const gexMinOldServers = 1024;
+
+  /// How long a group this client would like. A server picks the shortest
+  /// group it has that is at least this long, so this is the length a
+  /// server that has a choice will name. 3072 bits is about 128 bits of
+  /// work to break, which is where every other key exchange this client
+  /// offers stands (curve25519, the NIST curves), and what the secret it
+  /// brings to a group exchange is made for (256 bits, where the transport
+  /// takes the group a server names). It asked for 2048, the shortest it
+  /// takes at all and about 112 bits: a server with longer groups too named
+  /// its weakest. A longer group than this would add nothing while the
+  /// secret is 256 bits long.
+  static const gexPref = 3072;
   static const gexMax = 8192;
+
+  /// The shortest group a client asks for, and takes, where it was told
+  /// [wanted] (`SSHAlgorithms.minDhGroupBits`): never under
+  /// [gexMinOldServers], and never over [gexPref], since a request whose
+  /// shortest is longer than the one it would like is no request.
+  static int shortestAskedFor(int wanted) => wanted.clamp(gexMinOldServers, gexPref);
+
+  /// Refuses the group of the modulus [p] and the generator [g] that a
+  /// server named in a group exchange, where it cannot be used: of a length
+  /// other than was asked for ([shortest] to [gexMax] bits), a modulus that
+  /// is an even number (which is no prime), or a generator that is none.
+  /// With a generator of nought or one every secret is nought or one,
+  /// whatever either side does; with the modulus less one it is one of two
+  /// numbers; and anything from the modulus on is one of those again.
+  ///
+  /// [shortest] is the shortest group that was asked for: [gexMin], or
+  /// [gexMinOldServers] where an old server may have a shorter group. (A
+  /// [shortest] under [gexMinOldServers] is taken as [gexMinOldServers]:
+  /// no group shorter than that is ever taken.)
+  ///
+  /// (Whether [p] is a prime is not found out: that costs as much as the
+  /// exchange itself, and no client does.)
+  static void requireGroupOfAnExchange(BigInt p, BigInt g, {int shortest = gexMin}) {
+    final least = shortestAskedFor(shortest);
+    final bits = p.bitLength;
+    SSHKexGroupError refused(String why) => SSHKexGroupError(
+          'The server named a group for the key exchange $why',
+          bits: bits,
+          shortestTaken: least,
+        );
+    if (bits < least) {
+      throw refused('of $bits bits, and none under $least bits is taken');
+    }
+    if (bits > gexMax) {
+      throw refused('of $bits bits, and none over $gexMax bits was asked for');
+    }
+    if (p.isEven) {
+      throw refused('whose modulus is an even number, which is no prime');
+    }
+    if (g <= BigInt.one || g >= p - BigInt.one) {
+      throw refused('with a generator that is none: it has to be more than '
+          'one, and less than the modulus less one');
+    }
+  }
 
   /// p is a large safe prime
   final BigInt p;
@@ -33,7 +99,10 @@ class SSHKexDH implements SSHKex {
       throw ArgumentError('secretBits must be a multiple of 8');
     }
     x = decodeBigIntWithSign(1, randomBytes(secretBits ~/ 8));
-    e = g.modPow(x, p);
+    // (Not with BigInt.modPow, which answers wrong for numbers that are
+    // picked for it, and in a group exchange the other side names the
+    // generator and the modulus: see modPowExact.)
+    e = modPowExact(g, x, p);
   }
 
   /// https://tools.ietf.org/html/rfc2409 Second Oakley Group
@@ -60,7 +129,8 @@ class SSHKexDH implements SSHKex {
       throw SSHStateError(
           'DH server public value out of range (expected 1 < f < p-1)');
     }
-    return f.modPow(x, p);
+    // (The other side picks its public value: see modPowExact.)
+    return modPowExact(f, x, p);
   }
 }
 

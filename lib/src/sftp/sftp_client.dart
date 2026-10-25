@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:convert/convert.dart';
+import 'package:meta/meta.dart';
 import 'package:zest_ssh_core/src/sftp/sftp_errors.dart';
 import 'package:zest_ssh_core/src/sftp/sftp_file_attrs.dart';
 import 'package:zest_ssh_core/src/sftp/sftp_file_open_mode.dart';
@@ -40,15 +42,32 @@ class SftpClient {
   final SSHPrintHandler? printTrace;
 
   SftpClient(this._channel, {this.printDebug, this.printTrace}) {
+    // A handshake that fails with nobody waiting on it yet is no error
+    // thrown at nobody: whoever asks for it, or makes a request, gets it.
+    _handshake.future.ignore();
     _startHandshake();
-    _channel.stream.listen(_handleData);
+    _channel.stream.listen(_handleData, onDone: _handleChannelDone);
   }
 
   final _buffer = ChunkBuffer();
 
+  /// How many bytes from the server are held, not yet read as packets. For
+  /// tests.
+  @visibleForTesting
+  int get bufferedBytes => _buffer.length;
+
   final _handshake = Completer<SftpHandsake>();
 
-  final _done = Completer<void>();
+  /// What ended the session; null while it is open. Every request waiting
+  /// for a reply failed with it, the handshake did where it was not done,
+  /// and every request made afterwards fails with it at once.
+  Object? _ended;
+
+  /// Whether the session is over: closed from here ([close]), closed by the
+  /// server, or gone with its connection. Every request then fails with what
+  /// ended it; a session that is over is not opened again, and whoever holds
+  /// it opens another.
+  bool get isClosed => _ended != null;
 
   final _requestId = SftpRequestId();
 
@@ -73,11 +92,17 @@ class SftpClient {
   }
 
   /// Opens a file for reading or/and writing.
+  ///
+  /// [attrs] are the attributes a file that is made by this is made with
+  /// (its permissions, which the server's umask may narrow): a file that
+  /// only its owner may read is that from the moment it is there, and not
+  /// once its permissions are set afterwards.
   Future<SftpFile> open(
     String path, {
     SftpFileOpenMode mode = SftpFileOpenMode.read,
+    SftpFileAttrs? attrs,
   }) async {
-    final reply = await _sendOpen(path, mode, SftpFileAttrs());
+    final reply = await _sendOpen(path, mode, attrs ?? SftpFileAttrs());
     if (reply is SftpHandlePacket) return SftpFile(this, reply.handle);
     if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
     throw SftpStatusError.fromStatus(reply);
@@ -118,12 +143,28 @@ class SftpClient {
   /// Reads the items of a directory. Returns an [Stream] of [SftpName] chunks.
   /// Use [listdir] instead of this unless the directory contains a large number
   /// of items.
+  ///
+  /// The directory is closed on the server however the listing ends. Read to
+  /// its end, the stream is done when the server has answered the close, and
+  /// fails where the server refuses it. A listing that fails, and one that
+  /// whoever listens gives up, tells the server to let go of the directory
+  /// as well, and what the server says to that is nobody's: the listing has
+  /// failed with what it failed with, or is over for whoever gave it up.
+  /// (Until this, only a listing that was read to its end closed its
+  /// directory: every other left it open for as long as the session lasted,
+  /// and a server lets a session hold only so many.)
   Stream<List<SftpName>> readdir(String path) async* {
     final dir = await _opendir(path);
-    while (true) {
-      final names = await _readdir(dir);
-      if (names == null) break;
-      yield names;
+    var read = false;
+    try {
+      while (true) {
+        final names = await _readdir(dir);
+        if (names == null) break;
+        yield names;
+      }
+      read = true;
+    } finally {
+      if (!read) _close(dir).ignore();
     }
     await _close(dir);
   }
@@ -177,6 +218,25 @@ class SftpClient {
     SftpStatusError.check(reply);
   }
 
+  /// Whether the server can put a file in the place of another in one step
+  /// ([posixRename]).
+  Future<bool> get canPosixRename async => (await handshake).extensions['posix-rename@openssh.com'] == '1';
+
+  /// Renames [oldPath] to [newPath] as rename(2) does: where there is a file
+  /// under [newPath] already it is replaced, in one step, so that there is
+  /// no moment with no file under that name. ([rename] is refused for a name
+  /// that is taken by most servers, OpenSSH among them.)
+  ///
+  /// **Note**: This is an extension to the SFTP protocol, supported by most
+  /// openssh servers. A [SftpExtensionError] is thrown if the server does not
+  /// support this extension ([canPosixRename] says beforehand).
+  Future<void> posixRename(String oldPath, String newPath) async {
+    await _checkExtension('posix-rename@openssh.com', '1');
+    final reply = await _sendExtended(SftpPosixRenameRequest(oldPath: oldPath, newPath: newPath));
+    if (reply is! SftpStatusPacket) throw SftpError('Unexpected reply');
+    SftpStatusError.check(reply);
+  }
+
   /// Reads the target of a symbolic link.
   Future<String> readlink(String path) async {
     final reply = await _sendReadLink(path);
@@ -223,24 +283,45 @@ class SftpClient {
   /// already went away) is a no-op rather than a "Future already
   /// completed" crash.
   void close() {
-    if (_done.isCompleted) return;
-    for (var waiter in _replyWaiters.values) {
-      waiter.completeError(SftpAbortError("Connection closed"));
-    }
-    _replyWaiters.clear();
-    _done.complete();
+    _end(SftpAbortError("Connection closed"));
     // Fire-and-forget: the caller's close() is synchronous by contract and
     // a failure here only means the channel was already gone.
     _channel.close().catchError((_) {});
   }
 
-  void _closeError(Object error, [StackTrace? stackTrace]) {
+  /// The session is over, with [error]: for whoever waits for a reply, for
+  /// the handshake where the server had not answered it yet (every request
+  /// waits on that first), and for every request made from now on. Without
+  /// this each of them waited for ever. The first ending stands.
+  void _end(Object error, [StackTrace? stackTrace]) {
+    if (_ended != null) return;
+    _ended = error;
     stackTrace ??= StackTrace.current;
-    for (var waiter in _replyWaiters.values) {
+    if (!_handshake.isCompleted) {
+      _handshake.completeError(error, stackTrace);
+    }
+    final waiters = _replyWaiters.values.toList();
+    _replyWaiters.clear();
+    for (final waiter in waiters) {
       waiter.completeError(error, stackTrace);
     }
-    _replyWaiters.clear();
-    _done.completeError(error, stackTrace);
+    // What the server sent and was not read yet is nobody's any more.
+    _buffer.clear();
+  }
+
+  /// The channel ended under the session: the connection ended (then with
+  /// what it ended with), or the server closed the channel, its SFTP server
+  /// having ended.
+  void _handleChannelDone() {
+    _end(_channel.endedBecause ?? SftpAbortError('The server closed the SFTP session'));
+  }
+
+  /// What the server sent cannot be SFTP, or cannot be read: the session is
+  /// over, and the channel is torn down, so that a server that goes on
+  /// sending is not listened to.
+  void _closeError(Object error, [StackTrace? stackTrace]) {
+    _end(error, stackTrace);
+    _channel.destroy();
   }
 
   void _startHandshake() {
@@ -272,6 +353,10 @@ class SftpClient {
   }
 
   void _sendPacket(SftpPacket packet) {
+    // Nothing is sent for a session that is over, and whoever asked is told
+    // what ended it (every request comes through here before it waits).
+    final ended = _ended;
+    if (ended != null) throw ended;
     printTrace?.call('-> $_channel: $packet');
     final data = packet.encode();
     final writer = SSHMessageWriter();
@@ -477,14 +562,12 @@ class SftpClient {
     // session down cleanly. This runs in a stream listener with no onError, so
     // an uncaught throw here would surface as an unhandled zone error and can
     // crash the isolate. Instead, fail every pending request and close.
+    if (_ended != null) return;
     try {
       _buffer.add(data.bytes);
       _handlePackets();
     } catch (e, st) {
-      if (!_done.isCompleted) {
-        _closeError(e, st);
-        _channel.close().catchError((_) {});
-      }
+      _closeError(e, st);
     }
   }
 
@@ -508,6 +591,12 @@ class SftpClient {
       }
       final length = _buffer.byteData.getUint32(0);
       if (length > _kMaxPacketLength) {
+        // Before the server's first packet, this is no packet that is too
+        // long: it is something that is no SFTP at all, read as a length
+        // (any four letters of text are more than the cap).
+        if (!_handshake.isCompleted) {
+          throw SftpNotSftpError(_readable(_buffer.data));
+        }
         throw SftpError(
             'SFTP packet length $length exceeds maximum $_kMaxPacketLength');
       }
@@ -519,6 +608,18 @@ class SftpClient {
     }
   }
 
+  /// The start of [bytes] as someone can read it: its first line, at most
+  /// eighty characters, with nothing in it that is not a character to show.
+  static String _readable(Uint8List bytes) {
+    final text = utf8.decode(
+      Uint8List.sublistView(bytes, 0, min(bytes.length, 320)),
+      allowMalformed: true,
+    );
+    final line = text.split(RegExp(r'[\r\n]')).firstWhere((l) => l.trim().isNotEmpty, orElse: () => '');
+    final shown = line.replaceAll(RegExp(r'[\x00-\x1f\x7f\ufffd]'), '').trim();
+    return shown.length <= 80 ? shown : shown.substring(0, 80);
+  }
+
   /// Continue draining [_buffer] on the next macrotask (at most one pending).
   /// Mirrors the stream listener's error handling so a malformed reply in the
   /// deferred batch tears the client down the same way an immediate one does.
@@ -527,11 +628,11 @@ class SftpClient {
     _drainScheduled = true;
     Future<void>.delayed(Duration.zero, () {
       _drainScheduled = false;
+      if (_ended != null) return;
       try {
         _handlePackets();
       } catch (e, st) {
         _closeError(e, st);
-        _channel.close().catchError((_) {});
       }
     });
   }
@@ -567,14 +668,15 @@ class SftpClient {
     final packet = SftpVersionPacket.decode(payload);
     printTrace?.call('<- $_channel: $packet');
 
+    if (_handshake.isCompleted) {
+      throw SftpError('A second version packet from the server');
+    }
     if (packet.version == _kVersion) {
       final handshake = SftpHandsake(packet.version, packet.extensions);
       return _handshake.complete(handshake);
     }
 
-    final error = SftpError('Version mismatch: ${packet.version}');
-    _handshake.completeError(error, StackTrace.current);
-    _closeError(error);
+    throw SftpError('Version mismatch: ${packet.version}');
   }
 
   void _handleStatusPacket(Uint8List payload) {
@@ -625,10 +727,22 @@ class SftpFile {
 
   bool get isClosed => _isClosed;
 
+  /// Closes the file on the server. In a session that is over, or that ends
+  /// with the close on its way, there is nothing left to close and nothing
+  /// to fail: its handles went with it. (A close is often not waited for,
+  /// and its failing with the session's own end was an error for nobody.)
+  /// A close the server refuses fails as ever.
   Future<void> close() async {
     if (_isClosed) return;
     _isClosed = true;
-    await _client._close(_handle);
+    try {
+      await _client._close(_handle);
+    } catch (e) {
+      // (Asked of a session that is over, the close is not sent and fails
+      // with what ended the session, as every request does.)
+      if (identical(e, _client._ended)) return;
+      rethrow;
+    }
   }
 
   Future<SftpFileAttrs> stat() async {
@@ -646,10 +760,23 @@ class SftpFile {
     SftpStatusError.check(reply);
   }
 
-  /// Reads at most [count] bytes from the file starting at [offset]. If
-  /// [length] is null, reads until end of file.  Returns a [Stream] of chunks.
-  /// [onProgress] is called with the total number of bytes already read.
-  /// Use [readBytes] if you want a single Uint8List.
+  /// Reads the file from [offset], as a [Stream] of pieces: [length] bytes,
+  /// or fewer where the file ends first. [onProgress] is called with the
+  /// number of bytes read so far. Use [readBytes] for a single Uint8List.
+  ///
+  /// With no [length], the file is read to the size the server reports for
+  /// it, or to where it ends if that is sooner (Linux reports a whole page
+  /// for the few bytes of a file under /sys). A file that is being written
+  /// is read as far as it went when its size was asked, and not followed.
+  ///
+  /// Where the server reports no size, or none at all, only its answer to a
+  /// read says where the file ends, and the file is read to there: Linux
+  /// reports no size for what the kernel makes up as it is read (everything
+  /// under /proc), and taken at its word such a file came out empty. Nothing
+  /// says how far to read ahead then: one piece is asked for, and for each
+  /// that comes back whole twice as many may be on their way, up to
+  /// [maxPendingRequests]. (A file of no reported size that is written
+  /// faster than it is read is followed for as long as that goes on.)
   Stream<Uint8List> read({
     int? length,
     int offset = 0,
@@ -668,55 +795,61 @@ class SftpFile {
         'must be positive',
       );
     }
-
-    // Get the file size if not specified.
-    if (length == null) {
-      final fileStat = await stat();
-      final fileSize = fileStat.size;
-
-      if (fileSize == null) {
-        throw SftpError('Can not get file size');
-      }
-
-      length = fileSize - offset;
-    }
-
-    if (length == 0) return;
-
-    if (length < 0) {
+    if (length != null && length < 0) {
       throw SftpError('Length must be positive: $length');
     }
 
-    final endOffset = offset + length;
-    final pendingReads = <Future<Uint8List?>>[];
+    // Where the reading stops whatever the file holds. Null where nothing
+    // says: no length was asked for, and the server reports no size.
+    int? end;
+    if (length != null) {
+      end = offset + length;
+    } else {
+      final size = (await stat()).size;
+      if (size != null && size > 0) end = size;
+    }
+
+    final pendingReads = <({Future<Uint8List?> piece, int asked})>[];
     var nextOffset = offset;
     var bytesRead = 0;
+    // How many pieces may be on their way at a time.
+    var ahead = end == null ? 1 : maxPendingRequests;
 
-    while (bytesRead < length) {
-      while (
-          nextOffset < endOffset && pendingReads.length < maxPendingRequests) {
-        final requestLength = min(chunkSize, endOffset - nextOffset);
-        pendingReads.add(_readChunk(requestLength, nextOffset));
-        nextOffset += requestLength;
+    while (true) {
+      while (pendingReads.length < ahead && (end == null || nextOffset < end)) {
+        final asked = end == null ? chunkSize : min(chunkSize, end - nextOffset);
+        // Asked for ahead of where the stream is. Where the stream ends
+        // before it gets to this one (an earlier read failed, the file
+        // ended, the session is over, whoever listened has gone), nobody
+        // waits for it any more: its failing then is an error for nobody.
+        // Waited for, it fails as any other.
+        pendingReads.add((piece: _readChunk(asked, nextOffset)..ignore(), asked: asked));
+        nextOffset += asked;
       }
 
       if (pendingReads.isEmpty) break;
 
-      final chunk = await pendingReads.removeAt(0);
+      final next = pendingReads.removeAt(0);
+      final chunk = await next.piece;
       if (chunk == null) break;
       if (chunk.isEmpty) {
         throw SftpError('Unexpected empty data chunk before EOF');
       }
+      if (chunk.length > next.asked) {
+        // What follows it was asked for by where this piece was to end:
+        // taken as it is, bytes would be there twice, or missing.
+        throw SftpError('The server sent ${chunk.length} bytes where ${next.asked} were asked for');
+      }
 
-      final remaining = length - bytesRead;
-      final outputChunk = chunk.length <= remaining
-          ? chunk
-          : Uint8List.sublistView(chunk, 0, remaining);
+      yield chunk;
 
-      yield outputChunk;
-
-      bytesRead += outputChunk.length;
+      bytesRead += chunk.length;
       onProgress?.call(bytesRead);
+
+      // Fewer bytes than were asked for: the file ends here. What was asked
+      // for ahead of this is past its end, whatever came back for it.
+      if (chunk.length < next.asked) break;
+      if (end == null) ahead = min(ahead * 2, maxPendingRequests);
     }
   }
 

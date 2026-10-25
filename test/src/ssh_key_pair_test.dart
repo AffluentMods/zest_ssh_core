@@ -132,12 +132,22 @@ MAA=
     },
   );
 
-  test('SSHKeyPair.fromPem rejects passphrase for unencrypted EC PRIVATE KEY',
-      () {
-    expect(
-      () => SSHKeyPair.fromPem(legacyEcPrivateKey, 'test'),
-      throwsArgumentError,
-    );
+  // A passphrase given for a key that has none is not used, as OpenSSH does:
+  // one left saved beside a key whose passphrase was removed on another
+  // device must not make the key unreadable (it did: "key unreadable" at
+  // every sign-in).
+  test('SSHKeyPair.fromPem opens unencrypted OpenSSH and RSA keys given a passphrase', () {
+    for (final pem in [fixture('ssh-ed25519/id_ed25519'), rsaPrivateOpenSSH, rsaPrivate]) {
+      final withOne = SSHKeyPair.fromPem(pem, 'left behind');
+      final without = SSHKeyPair.fromPem(pem);
+      expect(withOne.single.toPublicKey().encode(), without.single.toPublicKey().encode());
+    }
+  });
+
+  test('SSHKeyPair.fromPem opens an unencrypted EC PRIVATE KEY given a passphrase', () {
+    final withOne = SSHKeyPair.fromPem(legacyEcPrivateKey, 'test');
+    final without = SSHKeyPair.fromPem(legacyEcPrivateKey);
+    expect(withOne.single.toPublicKey().encode(), without.single.toPublicKey().encode());
   });
 
   test('SSHKeyPair.isEncryptedPem detects encrypted EC PRIVATE KEY', () {

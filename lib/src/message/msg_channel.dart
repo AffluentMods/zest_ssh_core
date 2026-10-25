@@ -347,8 +347,9 @@ class SSH_Message_Channel_Open_Failure implements SSHMessage {
     reader.skip(1);
     final recipientChannel = reader.readUint32();
     final reasonCode = reader.readUint32();
-    final description = reader.readUtf8();
-    final languageTag = reader.readUtf8();
+    // Why, in the other side's words: read as far as it can be.
+    final description = reader.readUtf8(allowMalformed: true);
+    final languageTag = reader.readUtf8(allowMalformed: true);
     return SSH_Message_Channel_Open_Failure(
       recipientChannel: recipientChannel,
       reasonCode: reasonCode,
@@ -608,7 +609,10 @@ class SSH_Message_Channel_Request implements SSHMessage {
   final bool? singleConnection;
   final String? x11AuthenticationProtocol;
   final String? x11AuthenticationCookie;
-  final String? x11ScreenNumber;
+
+  /// A uint32 on the wire (RFC 4254, 6.3.1), as the screen of an X display is
+  /// a number.
+  final int? x11ScreenNumber;
 
   /// "env" request specific data
   final String? variableName;
@@ -689,7 +693,7 @@ class SSH_Message_Channel_Request implements SSHMessage {
     bool singleConnection = false,
     required String x11AuthenticationProtocol,
     required String x11AuthenticationCookie,
-    required String x11ScreenNumber,
+    required int x11ScreenNumber,
   }) {
     return SSH_Message_Channel_Request(
       recipientChannel: recipientChannel,
@@ -851,7 +855,7 @@ class SSH_Message_Channel_Request implements SSHMessage {
         final singleConnection = reader.readBool();
         final x11AuthenticationProtocol = reader.readUtf8();
         final x11AuthenticationCookie = reader.readUtf8();
-        final x11ScreenNumber = reader.readUtf8();
+        final x11ScreenNumber = reader.readUint32();
         return SSH_Message_Channel_Request(
           recipientChannel: recipientChannel,
           requestType: requestType,
@@ -917,8 +921,8 @@ class SSH_Message_Channel_Request implements SSHMessage {
       case SSHChannelRequestType.exitSignal:
         final exitSignalName = reader.readUtf8();
         final coreDumped = reader.readBool();
-        final errorMessage = reader.readUtf8();
-        final languageTag = reader.readUtf8();
+        final errorMessage = reader.readUtf8(allowMalformed: true);
+        final languageTag = reader.readUtf8(allowMalformed: true);
         return SSH_Message_Channel_Request.exitSignal(
           recipientChannel: recipientChannel,
           exitSignalName: exitSignalName,
@@ -955,7 +959,7 @@ class SSH_Message_Channel_Request implements SSHMessage {
         writer.writeBool(singleConnection!);
         writer.writeUtf8(x11AuthenticationProtocol!);
         writer.writeUtf8(x11AuthenticationCookie!);
-        writer.writeUtf8(x11ScreenNumber!);
+        writer.writeUint32(x11ScreenNumber!);
         break;
       case 'env':
         writer.writeUtf8(variableName!);

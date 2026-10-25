@@ -22,7 +22,9 @@ class SSHConnectionDiagnostics {
   /// The cipher algorithm negotiated during key exchange.
   String? negotiatedCipher;
 
-  /// The MAC algorithm negotiated during key exchange.
+  /// The MAC algorithm negotiated during key exchange. Empty where the
+  /// cipher checks its packets by itself (chacha20-poly1305, AES-GCM) and
+  /// so has no MAC beside it.
   String? negotiatedMac;
 
   /// The key exchange algorithm negotiated.
@@ -37,7 +39,9 @@ class SSHConnectionDiagnostics {
   /// The authentication method that ultimately succeeded.
   String? authMethodSucceeded;
 
-  /// Extensions advertised by the server.
+  /// The names of what the server said of itself with SSH_MSG_EXT_INFO
+  /// (RFC 8308), in its order: "server-sig-algs", and whatever else it has.
+  /// Empty where it said nothing.
   List<String> serverExtensions = [];
 
   SSHConnectionDiagnostics({DateTime? connectStarted})

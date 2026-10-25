@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:zest_ssh_core/src/http/http_client.dart';
 import 'package:zest_ssh_core/src/sftp/sftp_client.dart';
 import 'package:zest_ssh_core/src/dynamic_forward.dart';
+import 'package:zest_ssh_core/src/hostkey/hostkey_rsa.dart' show SSHRsaSignatureType;
 import 'package:zest_ssh_core/src/ssh_algorithm.dart';
 import 'package:zest_ssh_core/src/ssh_agent.dart';
 import 'package:zest_ssh_core/src/ssh_channel.dart';
@@ -18,6 +19,7 @@ import 'package:zest_ssh_core/src/ssh_transport.dart';
 import 'package:zest_ssh_core/src/transport/ssh_events.dart';
 import 'package:zest_ssh_core/src/transport/ssh_diagnostics.dart';
 import 'package:zest_ssh_core/src/utils/async_queue.dart';
+import 'package:zest_ssh_core/src/utils/list.dart';
 import 'package:zest_ssh_core/src/message/msg_channel.dart';
 import 'package:zest_ssh_core/src/message/msg_request.dart';
 import 'package:zest_ssh_core/src/message/msg_service.dart';
@@ -154,7 +156,9 @@ class SSHClient {
   final SSHHostkeyVerifyHandler? onVerifyHostKey;
 
   /// List of key pairs to use for authentication. Set this field to enable
-  /// authentication with public key.
+  /// authentication with public key. They are tried in this order: the
+  /// server is asked about each, and a key signs once the server has said
+  /// that it takes it (RFC 4252, 7).
   final List<SSHKeyPair>? identities;
 
   /// Set this field to enable the 'password' authentication method. Return null
@@ -187,9 +191,35 @@ class SSHClient {
   /// Optional handler for SSH agent forwarding requests.
   final SSHAgentHandler? agentHandler;
 
+  /// Called when the server refuses agent forwarding on this connection. The
+  /// session goes on without it, as it does with OpenSSH's own client; this
+  /// is how whoever set [agentHandler] learns that it has no effect here.
+  /// Called once for a connection: a server that has refused is not asked
+  /// again.
+  final void Function()? onAgentForwardingRefused;
+
+  /// Whether the server has refused agent forwarding on this connection:
+  /// asked for it, it said no, and it had not set the agent up before.
+  bool get agentForwardingRefused => _agentForwardingRefused;
+  bool _agentForwardingRefused = false;
+
+  /// The server has set the agent up, for at least one session.
+  bool _agentForwardingGiven = false;
+
+  /// The server is not asked again on this connection: it refused, or it set
+  /// the agent up and then said no to setting it up a second time.
+  bool _agentForwardingSettled = false;
+
   /// The interval at which to send a keep-alive message through the [ping]
   /// method. Set this to null to disable automatic keep-alive messages.
   final Duration? keepAliveInterval;
+
+  /// How many keep-alives in a row may go unanswered, with nothing else
+  /// coming from the server either, before the connection is given up as
+  /// one that has gone quiet: it ends with an [SSHNoAnswerError]. Three, as
+  /// OpenSSH's ServerAliveCountMax; with [keepAliveInterval] that is four
+  /// intervals at the most from the last thing heard to the end.
+  final int keepAliveMaxUnanswered;
 
   /// Function called when additional host keys are received. This is an OpenSSH
   /// extension. May not be called if the server does not support the extension.
@@ -197,6 +227,16 @@ class SSHClient {
 
   /// Allow to disable hostkey verification, which can be slow in debug mode.
   final bool disableHostkeyVerification;
+
+  /// How many bytes go out, or come in, under one set of keys before the
+  /// client asks for new ones: a gigabyte where nothing is said
+  /// ([SSHTransport.rekeyAfterBytes]).
+  final int rekeyAfterBytes;
+
+  /// How many packets go out, or come in, under one set of keys before the
+  /// client asks for new ones: 2^31 where nothing is said
+  /// ([SSHTransport.rekeyAfterPackets]).
+  final int rekeyAfterPackets;
 
   /// Identification string advertised during the SSH version exchange (the part
   /// after `SSH-2.0-`). Defaults to [kDefaultClientIdent]
@@ -217,6 +257,11 @@ class SSHClient {
   /// Diagnostics data collected across the connection lifecycle.
   SSHConnectionDiagnostics get diagnostics => _diagnostics;
 
+  /// The kinds of signature the server has said it takes from a key that
+  /// signs in ("server-sig-algs", RFC 8308, 3.1), in its order, or null
+  /// where it has not said.
+  List<String>? get serverSignatureAlgorithms => _transport.serverSignatureAlgorithms;
+
   SSHClient(
     this.socket, {
     required this.username,
@@ -232,8 +277,12 @@ class SSHClient {
     this.onAuthenticated,
     this.onX11Forward,
     this.agentHandler,
+    this.onAgentForwardingRefused,
     this.keepAliveInterval = const Duration(seconds: 10),
+    this.keepAliveMaxUnanswered = 3,
     this.disableHostkeyVerification = false,
+    this.rekeyAfterBytes = SSHTransport.defaultRekeyAfterBytes,
+    this.rekeyAfterPackets = SSHTransport.defaultRekeyAfterPackets,
     String ident = kDefaultClientIdent,
   }) : ident = _validateIdent(ident) {
     _diagnostics = SSHConnectionDiagnostics();
@@ -253,8 +302,11 @@ class SSHClient {
       onKexNegotiated: _handleKexNegotiated,
       onKexCompleted: _handleKexCompleted,
       onHostKeyReceived: _handleHostKeyReceived,
+      onExtInfo: _handleExtInfo,
       disableHostkeyVerification: disableHostkeyVerification,
       version: ident,
+      rekeyAfterBytes: rekeyAfterBytes,
+      rekeyAfterPackets: rekeyAfterPackets,
     );
 
     _transport.done.then(
@@ -322,15 +374,54 @@ class SSHClient {
 
   final _channels = <int, SSHChannelController>{};
 
+  /// The ways of signing in this client has something for and has not used
+  /// up, in the order it prefers them.
   final _authMethodsLeft = Queue<SSHAuthMethod>();
 
   final _keyPairsLeft = Queue<SSHKeyPair>();
 
+  /// The ways the key that is being tried may still sign in to this server,
+  /// after the one it was asked about: an RSA key has a second where the
+  /// server has not said what it takes ([_waysToSignInWith]).
+  final _waysLeft = Queue<SSHKeyPair>();
+
+  /// The kinds of the keys the server was not asked about, since it had
+  /// said that it takes no signature they may make here, for whoever is
+  /// told that the sign-in failed ([SSHAuthFailError.keysPassedOver]).
+  final _keysPassedOver = <String>[];
+
+  /// The key the server was asked about and has not said yes to: its yes is
+  /// what the key signs for ([_handleUserauthPkOk]).
+  SSHKeyPair? _keyAsked;
+
+  /// The ways of signing in the server said it takes, with its last refusal
+  /// ("authentications that can continue", RFC 4252, 5.1). The first thing
+  /// it is asked is which they are, so nothing is tried before it has said.
+  var _serverTakes = const <String>[];
+
+  /// The ways that were tried, in the order they were first tried, for
+  /// whoever is told that the sign-in failed ([SSHAuthFailError]).
+  final _methodsTried = <String>[];
+
   final _remoteForwards = <SSHRemoteForward>{};
 
   late final _keepAlive = keepAliveInterval != null
-      ? SSHKeepAlive(ping: ping, interval: keepAliveInterval!)
+      ? SSHKeepAlive(
+          ping: ping,
+          interval: keepAliveInterval!,
+          maxUnanswered: keepAliveMaxUnanswered,
+          heard: () => _transport.bytesReceived,
+          onNoAnswer: _handleNoAnswer,
+        )
       : null;
+
+  /// The connection has gone quiet: keep-alives went unanswered, and nothing
+  /// else came. It is given up, where it was held to be open for as long as
+  /// the system held it to be.
+  void _handleNoAnswer(Duration silence) {
+    printDebug?.call('SSHClient: nothing from the server for $silence, giving the connection up');
+    _transport.closeWithError(SSHNoAnswerError(silence, keepAliveMaxUnanswered));
+  }
 
   SSHAuthMethod? _currentAuthMethod;
 
@@ -492,21 +583,12 @@ class SSHClient {
       for (var pair in environment.entries) {
         final envOk = await channelController.sendEnv(pair.key, pair.value);
         if (!envOk) {
-          channelController.close();
-          throw SSHChannelRequestError(
-            'Failed to set environment variable: ${pair.key}',
-          );
+          _refused(channelController, 'Failed to set environment variable: ${pair.key}');
         }
       }
     }
 
-    if (agentHandler != null) {
-      final agentOk = await channelController.sendAgentForwardingRequest();
-      if (!agentOk) {
-        channelController.close();
-        throw SSHChannelRequestError('Failed to request agent forwarding');
-      }
-    }
+    await _askAgentForwarding(channelController);
 
     if (pty != null) {
       final ptyOk = await channelController.sendPtyReq(
@@ -517,8 +599,7 @@ class SSHClient {
         terminalPixelHeight: pty.pixelHeight,
       );
       if (!ptyOk) {
-        channelController.close();
-        throw SSHChannelRequestError('Failed to start pty');
+        _refused(channelController, 'Failed to start pty');
       }
     }
 
@@ -530,18 +611,22 @@ class SSHClient {
         screenNumber: x11.screenNumber,
       );
       if (!x11Ok) {
-        channelController.close();
-        throw SSHChannelRequestError('Failed to request x11 forwarding');
+        _refused(channelController, 'Failed to request x11 forwarding');
       }
     }
 
+    // The session is there before the program is asked for. What a server
+    // sends behind its yes (what the program printed, how it ended) can come
+    // in the same read as the yes, for a program that ends at once: a
+    // request that found no session listening was dropped, and how the
+    // program had ended was never known.
+    final session = SSHSession(channelController.channel);
     final success = await channelController.sendExec(command);
     if (!success) {
-      channelController.close();
-      throw SSHChannelRequestError('Failed to execute');
+      _refused(channelController, 'Failed to execute');
     }
 
-    return SSHSession(channelController.channel);
+    return session;
   }
 
   /// Start a shell on the remote side. Returns a [SSHSession] that can be
@@ -559,21 +644,12 @@ class SSHClient {
       for (var pair in environment.entries) {
         final envOk = await channelController.sendEnv(pair.key, pair.value);
         if (!envOk) {
-          channelController.close();
-          throw SSHChannelRequestError(
-            'Failed to set environment variable: ${pair.key}',
-          );
+          _refused(channelController, 'Failed to set environment variable: ${pair.key}');
         }
       }
     }
 
-    if (agentHandler != null) {
-      final agentOk = await channelController.sendAgentForwardingRequest();
-      if (!agentOk) {
-        channelController.close();
-        throw SSHChannelRequestError('Failed to request agent forwarding');
-      }
-    }
+    await _askAgentForwarding(channelController);
 
     if (pty != null) {
       final ok = await channelController.sendPtyReq(
@@ -584,8 +660,7 @@ class SSHClient {
         terminalPixelHeight: pty.pixelHeight,
       );
       if (!ok) {
-        channelController.close();
-        throw SSHChannelRequestError('Failed to start pty');
+        _refused(channelController, 'Failed to start pty');
       }
     }
 
@@ -597,24 +672,76 @@ class SSHClient {
         screenNumber: x11.screenNumber,
       );
       if (!x11Ok) {
-        channelController.close();
-        throw SSHChannelRequestError('Failed to request x11 forwarding');
+        _refused(channelController, 'Failed to request x11 forwarding');
       }
     }
 
+    // (There before the shell is asked for, as in [execute]: an account
+    // whose shell prints a notice and leaves has ended by the time the
+    // server's yes is read.)
+    final session = SSHSession(channelController.channel);
     if (!await channelController.sendShell()) {
-      channelController.close();
-      throw SSHChannelRequestError('Failed to start shell');
+      _refused(channelController, 'Failed to start shell');
     }
 
-    return SSHSession(channelController.channel);
+    return session;
   }
 
   Future<void> subsystem(String subsystem) async {
     await _authenticated.future;
 
     final channelController = await _openSessionChannel();
-    channelController.sendSubsystem(subsystem);
+    await _startSubsystem(channelController, subsystem);
+  }
+
+  /// Asks for [subsystem] on a session channel and waits for the server's
+  /// answer. A server that refuses it (the subsystem is not set up there) is
+  /// an error here, with the channel closed, and not a channel on which
+  /// nothing ever answers.
+  Future<void> _startSubsystem(SSHChannelController channelController, String subsystem) async {
+    if (!await channelController.sendSubsystem(subsystem)) {
+      _refused(channelController, 'The server refused the "$subsystem" subsystem');
+    }
+  }
+
+  /// Asks the server to forward the agent for the session on
+  /// [channelController], where there is one to forward. Its answer is no
+  /// reason to give the session up, whatever it is: OpenSSH's own client
+  /// does not even wait for it.
+  ///
+  /// A server answers no for one of two reasons. It allows no agent
+  /// forwarding (its configuration, or the key that signed in is marked so):
+  /// the session goes on without the agent, and [onAgentForwardingRefused]
+  /// is told, once. Or it has set the agent up already: OpenSSH does that
+  /// once for a connection, for every session on it, and says no to doing
+  /// it a second time, so the second session of a connection gets a no
+  /// while the agent is there for it. Either way the answer stands for the
+  /// connection and the server is not asked again, where it was asked, and
+  /// said no, for every command. A server that sets the agent up for each
+  /// session by itself says yes each time, and goes on being asked.
+  Future<void> _askAgentForwarding(SSHChannelController channelController) async {
+    if (agentHandler == null || _agentForwardingSettled) return;
+    if (await channelController.sendAgentForwardingRequest()) {
+      _agentForwardingGiven = true;
+      return;
+    }
+    // (Two sessions started at once both asked before either was answered.)
+    if (_agentForwardingSettled) return;
+    _agentForwardingSettled = true;
+    if (_agentForwardingGiven) return;
+    _agentForwardingRefused = true;
+    onAgentForwardingRefused?.call();
+  }
+
+  /// The server refused what [channelController]'s channel was opened for.
+  /// The channel is closed in full before the refusal is thrown: a close that
+  /// waits for the other side to end first would wait as long as the
+  /// connection lasts, nothing having been started there that could end, and
+  /// the channel would count against the sessions the server allows one
+  /// connection for all that time.
+  Never _refused(SSHChannelController channelController, String message) {
+    channelController.destroy();
+    throw SSHChannelRequestError(message);
   }
 
   /// Open a new SFTP session. Returns a [SftpClient] that can be used to
@@ -623,7 +750,7 @@ class SSHClient {
     await _authenticated.future;
 
     final channelController = await _openSessionChannel();
-    channelController.sendSubsystem('sftp');
+    await _startSubsystem(channelController, 'sftp');
 
     return SftpClient(
       channelController.channel,
@@ -731,20 +858,26 @@ class SSHClient {
   /// Shutdown the entire SSH connection. Sessions and channels will also be
   /// closed immediately.
   void close() {
-    _closeChannels();
+    _closeChannels(_closedUnanswered());
     _transport.close();
     // _handleTransportClosed will emit the disconnect event and close the
     // stream controller, so we don't duplicate that here.
   }
 
-  /// Close all channels that are currently open.
-  void _closeChannels() {
+  /// What a request fails with that was still waiting for its reply when the
+  /// connection was closed, where nothing else says why it was.
+  static SSHStateError _closedUnanswered() =>
+      SSHStateError('Connection closed before the request was answered');
+
+  /// Close all channels that are currently open, the connection having ended
+  /// with [because].
+  void _closeChannels(Object because) {
     for (final channel in _channels.values) {
       // One channel failing to tear down (e.g. a send on an already-dead
       // transport) must not abort this loop and leave the remaining channels
       // undestroyed with leaked done futures, or skip _channels.clear().
       try {
-        channel.destroy();
+        channel.destroy(because);
       } catch (e) {
         printDebug?.call('SSHClient._closeChannels - destroy error: $e');
       }
@@ -792,6 +925,10 @@ class SSHClient {
     ));
   }
 
+  void _handleExtInfo() {
+    _diagnostics.serverExtensions = _transport.serverExtensions;
+  }
+
   void _handleTransportReady() {
     printDebug?.call('SSHClient._onTransportReady');
     _requestAuthentication();
@@ -808,18 +945,27 @@ class SSHClient {
     _keepAlive?.stop();
 
     // Complete any pending channel-open waiters so callers (e.g.
-    // forwardLocalUnix) don't hang forever when the connection drops.
+    // forwardLocalUnix) don't hang forever when the connection drops. They
+    // fail with what ended the connection, as a request that was waiting
+    // does (below), and with this where it closed with no error.
     for (final entry in _channelOpenReplyWaiters.entries) {
       if (!entry.value.isCompleted) {
         entry.value.completeError(
-          SSHStateError('Connection closed while waiting for channel open'),
+          error ?? SSHStateError('Connection closed while waiting for channel open'),
         );
       }
     }
     _channelOpenReplyWaiters.clear();
 
+    // Nor does a request still waiting for its reply: none will come. The
+    // connection's own (a remote forward asked for or taken back, a
+    // keep-alive) and those of its channels (a terminal, a shell, a command,
+    // a subsystem) all fail with what ended the connection.
+    final because = error ?? _closedUnanswered();
+    _globalRequestReplyQueue.close(because);
+
     try {
-      _closeChannels();
+      _closeChannels(because);
     } catch (e) {
       printDebug?.call("SSHClient::_handleTransportClosed - error: $e");
     }
@@ -958,6 +1104,13 @@ class SSHClient {
     _eventController.add(SSHEventAuthMethodFailed(
       method: _currentAuthMethod?.name ?? 'unknown',
     ));
+    // Which ways it takes from here on. (The list was read and dropped, and
+    // the client went through what it had in an order of its own: a
+    // password went to a server that had just said it takes only keys.)
+    _serverTakes = List.unmodifiable(message.methodsLeft);
+    // A key that was one step of several has signed in: its other ways of
+    // signing are of no use any more.
+    if (message.partialSuccess) _waysLeft.clear();
     _tryNextAuthMethod();
   }
 
@@ -965,6 +1118,8 @@ class SSHClient {
     printDebug?.call('SSHClient._handleUserauthIntermidiate');
 
     switch (_currentAuthMethod) {
+      case SSHAuthMethod.publicKey:
+        return _handleUserauthPkOk(payload);
       case SSHAuthMethod.password:
         return _catch(() => _handleUserauthPasswordChangeRequest(payload));
       case SSHAuthMethod.keyboardInteractive:
@@ -972,6 +1127,33 @@ class SSHClient {
       default:
         printDebug?.call('unknown auth method: $_currentAuthMethod');
     }
+  }
+
+  /// The server's yes to the question about a key (RFC 4252, 7): the key
+  /// signs now, and its signature goes to the server.
+  ///
+  /// The yes is taken for the key it names. One that names another key than
+  /// the one asked about is no yes to this one: nothing is signed, and the
+  /// next key or way is tried. The kind of signature it names is not held
+  /// against it: a server may put the key's own kind there, "ssh-rsa" where
+  /// "rsa-sha2-256" was asked. A yes that comes with no question open (a
+  /// second one, or one after the sign-in has ended) is passed over, so a
+  /// key signs once for each time it was asked about.
+  void _handleUserauthPkOk(Uint8List payload) {
+    final message = SSH_Message_Userauth_PkOk.decode(payload);
+    printTrace?.call('<- $socket: $message');
+
+    final keyPair = _keyAsked;
+    _keyAsked = null;
+    if (keyPair == null || _authenticated.isCompleted) {
+      printDebug?.call('SSHClient: ignoring USERAUTH_PK_OK with no question open');
+      return;
+    }
+    if (!message.publicKey.equals(keyPair.toPublicKey().encode())) {
+      printDebug?.call('SSHClient: USERAUTH_PK_OK names another key than the one asked about');
+      return _tryNextAuthMethod();
+    }
+    _signInWithKey(keyPair);
   }
 
   Future<void> _handleUserauthPasswordChangeRequest(Uint8List payload) async {
@@ -1350,14 +1532,34 @@ class SSHClient {
       _authMethodsLeft.add(SSHAuthMethod.keyboardInteractive);
     }
 
-    _authMethodsLeft.add(SSHAuthMethod.none);
-
     _eventController.add(SSHEventAuthStarted(
-      availableMethods: _authMethodsLeft.map((m) => m.name).toList(),
+      availableMethods: [SSHAuthMethod.none.name, ..._authMethodsLeft.map((m) => m.name)],
     ));
 
-    _tryNextAuthMethod();
+    // Asked first of all, with the way called "none": which ways the server
+    // takes. Nothing is offered with the question; a server answers it with
+    // its list, or lets in with it where it lets everybody in. (It was
+    // asked last, after every key and the password had been sent, where it
+    // also counts as one more failed try on a server that counts them.)
+    _currentAuthMethod = SSHAuthMethod.none;
+    _authWithNone();
   }
+
+  /// Whether the server takes [way], by what it said last.
+  bool _serverTakesWay(SSHAuthMethod way) => _serverTakes.contains(way.name);
+
+  /// [way] is being tried: its request goes to the server now.
+  void _trying(SSHAuthMethod way) {
+    if (!_methodsTried.contains(way.name)) _methodsTried.add(way.name);
+  }
+
+  SSHAuthFailError _signInFailed(String message) => SSHAuthFailError(
+        message,
+        methodsTried: List.unmodifiable(_methodsTried),
+        serverTakes: _serverTakes,
+        keysPassedOver: List.unmodifiable(_keysPassedOver),
+        serverSignatureAlgorithms: _transport.serverSignatureAlgorithms,
+      );
 
   void _tryNextAuthMethod() {
     printDebug?.call('SSHClient._tryNextAuthenticationMethod');
@@ -1365,39 +1567,43 @@ class SSHClient {
     _authAttemptCount++;
     if (_authAttemptCount > _maxAuthAttempts) {
       return _authenticated.completeError(
-        SSHAuthFailError(
-          'Max authentication attempts ($_maxAuthAttempts) exceeded',
-        ),
+        _signInFailed('Max authentication attempts ($_maxAuthAttempts) exceeded'),
         StackTrace.current,
       );
     }
 
-    if (_currentAuthMethod == SSHAuthMethod.publicKey) {
-      if (_keyPairsLeft.isNotEmpty) {
-        return _authWithNextPublicKey();
+    // The first way this client still has something for that the server
+    // takes: the next key while it takes keys, then the password, then its
+    // questions. A way it does not take now stays for a later step, where a
+    // server asks for more than one and names the next after each.
+    for (final way in _authMethodsLeft.toList()) {
+      if (!_serverTakesWay(way)) continue;
+      SSHKeyPair? keyPair;
+      if (way == SSHAuthMethod.publicKey) {
+        // (Keys are a way for as long as there is another key, or another
+        // way for a key to sign, that the server can be asked about.)
+        keyPair = _nextKeyToAskAbout();
+        if (keyPair == null) continue;
+      } else {
+        _authMethodsLeft.remove(way);
+      }
+      _currentAuthMethod = way;
+      printDebug?.call('_currentAuthMethod = $_currentAuthMethod');
+      switch (way) {
+        case SSHAuthMethod.none:
+          // (Asked once, first of all, and never among what is left.)
+          continue;
+        case SSHAuthMethod.password:
+          return _catch(() => _authWithPassword());
+        case SSHAuthMethod.publicKey:
+          return _authWithPublicKey(keyPair!);
+        case SSHAuthMethod.keyboardInteractive:
+          return _authWithKeyboardInteractive();
       }
     }
 
-    if (_authMethodsLeft.isEmpty) {
-      return _authenticated.completeError(
-        SSHAuthFailError('All authentication methods failed'),
-        StackTrace.current,
-      );
-    }
-
-    _currentAuthMethod = _authMethodsLeft.removeFirst();
-    printDebug?.call('_currentAuthMethod = $_currentAuthMethod');
-
-    switch (_currentAuthMethod!) {
-      case SSHAuthMethod.none:
-        return _authWithNone();
-      case SSHAuthMethod.password:
-        return _catch(() => _authWithPassword());
-      case SSHAuthMethod.publicKey:
-        return _authWithNextPublicKey();
-      case SSHAuthMethod.keyboardInteractive:
-        return _authWithKeyboardInteractive();
-    }
+    // Nothing is left that the server takes.
+    return _authenticated.completeError(_signInFailed('All authentication methods failed'), StackTrace.current);
   }
 
   void _authWithNone() {
@@ -1418,21 +1624,105 @@ class SSHClient {
       return;
     }
 
+    _trying(SSHAuthMethod.password);
     _sendMessage(
       SSH_Message_Userauth_Request.password(user: username, password: password),
     );
   }
 
-  void _authWithNextPublicKey() {
+  /// The next key the server is to be asked about, as it would sign in to
+  /// this server, or null where no key is left. A key that cannot sign in
+  /// to this server is passed over on the way ([_waysToSignInWith]), and
+  /// its kind kept for what a refusal says.
+  SSHKeyPair? _nextKeyToAskAbout() {
+    while (_waysLeft.isEmpty && _keyPairsLeft.isNotEmpty) {
+      final keyPair = _keyPairsLeft.removeFirst();
+      final ways = _waysToSignInWith(keyPair);
+      if (ways.isEmpty) {
+        printDebug?.call(
+          'SSHClient: a key (${keyPair.name}) is passed over: the server takes no kind of signature it may make here',
+        );
+        _keysPassedOver.add(keyPair.name);
+      }
+      _waysLeft.addAll(ways);
+    }
+    return _waysLeft.isEmpty ? null : _waysLeft.removeFirst();
+  }
+
+  /// The ways [keyPair] may sign in to this server, the one the server is
+  /// asked about first first.
+  ///
+  /// A key signs in one way, but for an RSA key, which makes three kinds of
+  /// signature (RFC 8332): of those, this client may make
+  /// [SSHAlgorithms.rsaSignatures], and would rather make them in that
+  /// order. Where the server has said which kinds it takes
+  /// ([serverSignatureAlgorithms]), the key signs with the first of them
+  /// that the server takes, and is not asked about at all where it takes
+  /// none: the server has said that it would refuse. Where the server has
+  /// not said, the key is asked about with SHA-256, as it always was (a
+  /// server that knows of SHA-2 takes it), and then, where this client may
+  /// make it, with the first kind, with SHA-1, which is all that a server
+  /// from before 2016 knows. It is not asked about with SHA-512 as well: a
+  /// question a server refuses is one of the tries it allows.
+  ///
+  /// (An RSA key signed with SHA-256 whatever the server had said. So it
+  /// was refused by a server that takes only SHA-512, and by one that knows
+  /// only the first kind, with nothing to say why.)
+  List<SSHKeyPair> _waysToSignInWith(SSHKeyPair keyPair) {
+    if (keyPair is! SSHRsaSignatureChoice) return [keyPair];
+    final has = keyPair.rsaSignatureTypes;
+    if (has.isEmpty) return [keyPair];
+    final may = [
+      for (final kind in algorithms.rsaSignatures)
+        if (has.contains(kind)) kind,
+    ];
+    final takes = _transport.serverSignatureAlgorithms;
+    final List<String> kinds;
+    if (takes != null) {
+      kinds = may.where(takes.contains).take(1).toList();
+    } else {
+      final withSha2 = may.where((kind) => kind != SSHRsaSignatureType.sha1);
+      kinds = [
+        if (withSha2.contains(SSHRsaSignatureType.sha256)) SSHRsaSignatureType.sha256 else ...withSha2.take(1),
+        if (may.contains(SSHRsaSignatureType.sha1)) SSHRsaSignatureType.sha1,
+      ];
+    }
+    return [for (final kind in kinds) keyPair.signingAsRsa(kind)];
+  }
+
+  /// Asks the server whether it would take [keyPair], with no signature
+  /// (RFC 4252, 7). The key signs once the server has said yes
+  /// ([_handleUserauthPkOk]), and is passed over where it says no.
+  ///
+  /// (The question was never asked: the key signed at once, and its
+  /// signature went with the request. So every key a client had signed for
+  /// every server that takes keys at all, a hardware key was touched and an
+  /// agent asked for each of them, and the server refused most.)
+  void _authWithPublicKey(SSHKeyPair keyPair) {
     printDebug?.call('SSHClient._authWithPublicKey');
     _diagnostics.authMethodsTried.add('publickey');
 
-    final keyPair = _keyPairsLeft.removeFirst();
     _eventController.add(SSHEventAuthMethodAttempted(
       method: 'publickey',
       identityHint: keyPair.type,
     ));
 
+    _keyAsked = keyPair;
+    _trying(SSHAuthMethod.publicKey);
+    _sendMessage(
+      SSH_Message_Userauth_Request.publicKey(
+        username: username,
+        publicKeyAlgorithm: keyPair.type,
+        publicKey: keyPair.toPublicKey().encode(),
+        signature: null,
+      ),
+    );
+  }
+
+  /// Signs in with [keyPair], which the server has said it takes: the key
+  /// signs what binds its signature to this connection, and the request
+  /// goes out with it.
+  void _signInWithKey(SSHKeyPair keyPair) {
     final challenge = _transport.composeChallenge(
       username: username,
       service: 'ssh-connection',
@@ -1470,6 +1760,20 @@ class SSHClient {
         }
         return;
       }
+      // So must a key that could not make a signature of its own (the
+      // numbers of an RSA key do not fit each other, or its signature came
+      // out wrong and was held back): the sign-in ends, saying that. Its
+      // person is to be told that the key is no good, and it was passed
+      // over without a word, which read as a sign-in the server refused.
+      if (error is SSHKeySignError) {
+        if (!_authenticated.isCompleted) {
+          _authenticated.completeError(
+            SSHAuthAbortError('The key could not sign', error),
+            stack,
+          );
+        }
+        return;
+      }
       printDebug?.call('SSHClient._authWithPublicKey sign error: $error');
       _tryNextAuthMethod();
     });
@@ -1481,6 +1785,7 @@ class SSHClient {
     _eventController.add(
       const SSHEventAuthMethodAttempted(method: 'keyboard-interactive'),
     );
+    _trying(SSHAuthMethod.keyboardInteractive);
     _sendMessage(
       SSH_Message_Userauth_Request.keyboardInteractive(user: username),
     );
@@ -1609,11 +1914,17 @@ class SSHRemoteForward {
 
   Stream<SSHForwardChannel> get connections => _connections.stream;
 
+  /// Stops the forward: no more connections are handed out, and the server
+  /// is asked to stop listening. Its answer is not waited for, so what
+  /// becomes of the question is nobody's to catch: on a connection that has
+  /// ended, or ends before the answer, there is nothing left to stop there,
+  /// and that is no error of the close. (Whoever wants the answer asks
+  /// [SSHClient.cancelForwardRemote] and waits for it.)
   void close() {
     _connections.close();
-    _client.cancelForwardRemote(this);
+    _client.cancelForwardRemote(this).ignore();
   }
 
   @override
-  String toString() => '$runtimeType($host:$port)';
+  String toString() => 'SSHRemoteForward($host:$port)';
 }

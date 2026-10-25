@@ -57,6 +57,25 @@ class SftpFstatVfsRequest extends SftpExtendedRequest {
   }
 }
 
+/// Puts a file in the place of another as rename(2) does: what is there
+/// under the new name is replaced, in one step.
+class SftpPosixRenameRequest extends SftpExtendedRequest {
+  SftpPosixRenameRequest({required this.oldPath, required this.newPath});
+
+  @override
+  final String name = 'posix-rename@openssh.com';
+
+  final String oldPath;
+
+  final String newPath;
+
+  @override
+  void writeTo(SSHMessageWriter writer) {
+    writer.writeUtf8(oldPath);
+    writer.writeUtf8(newPath);
+  }
+}
+
 /// uint64		f_bsize		/* file system block size */
 /// uint64		f_frsize	/* fundamental fs block size */
 /// uint64		f_blocks	/* number of blocks (unit f_frsize) */

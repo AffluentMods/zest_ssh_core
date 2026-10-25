@@ -89,6 +89,6 @@ class SSHPem {
 
   @override
   String toString() {
-    return '$runtimeType($type, length: ${content.length})';
+    return 'SSHPem($type, length: ${content.length})';
   }
 }

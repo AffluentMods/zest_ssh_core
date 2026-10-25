@@ -110,6 +110,9 @@ class SSHCipherType extends SSHAlgorithm {
   @override
   final String name;
 
+  @override
+  String get typeName => 'SSHCipherType';
+
   final int keySize;
 
   /// Indicates whether this cipher is an AEAD mode (e.g. AES-GCM, ChaCha20-Poly1305).

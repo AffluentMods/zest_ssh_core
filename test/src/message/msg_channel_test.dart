@@ -190,6 +190,33 @@ void main() {
   });
 
   group('SSH_Message_Channel_Request', () {
+    test('x11-req is laid out as RFC 4254 (6.3.1) says: the screen number is a uint32, the last four bytes', () {
+      final encoded = SSH_Message_Channel_Request.x11(
+        recipientChannel: 5,
+        wantReply: true,
+        singleConnection: true,
+        x11AuthenticationProtocol: 'MIT-MAGIC-COOKIE-1',
+        x11AuthenticationCookie: 'deadbeef',
+        x11ScreenNumber: 258,
+      ).encode();
+
+      // byte SSH_MSG_CHANNEL_REQUEST, uint32 recipient channel,
+      // string "x11-req", boolean want reply, boolean single connection,
+      // string protocol, string cookie, uint32 screen number.
+      List<int> text(String s) => [0, 0, 0, s.length, ...s.codeUnits];
+      expect(encoded, [
+        98,
+        0, 0, 0, 5,
+        ...text('x11-req'),
+        1,
+        1,
+        ...text('MIT-MAGIC-COOKIE-1'),
+        ...text('deadbeef'),
+        0, 0, 1, 2,
+      ]);
+      expect(SSH_Message_Channel_Request.decode(encoded).x11ScreenNumber, 258);
+    });
+
     test('x11-req encode/decode roundtrip', () {
       final message = SSH_Message_Channel_Request.x11(
         recipientChannel: 5,
@@ -197,7 +224,7 @@ void main() {
         singleConnection: true,
         x11AuthenticationProtocol: 'MIT-MAGIC-COOKIE-1',
         x11AuthenticationCookie: 'deadbeef',
-        x11ScreenNumber: '0',
+        x11ScreenNumber: 0,
       );
 
       final decoded = SSH_Message_Channel_Request.decode(message.encode());
@@ -208,7 +235,7 @@ void main() {
       expect(decoded.singleConnection, isTrue);
       expect(decoded.x11AuthenticationProtocol, 'MIT-MAGIC-COOKIE-1');
       expect(decoded.x11AuthenticationCookie, 'deadbeef');
-      expect(decoded.x11ScreenNumber, '0');
+      expect(decoded.x11ScreenNumber, 0);
     });
 
     test('auth-agent request encode/decode roundtrip', () {

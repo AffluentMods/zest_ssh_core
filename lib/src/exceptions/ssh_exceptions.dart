@@ -15,9 +15,14 @@ abstract class SSHException implements Exception {
   /// Optional underlying cause for exception chaining.
   Object? get cause;
 
+  /// What this kind of failure is called in code, spelled out by each kind
+  /// and not asked of the program (`runtimeType`): a program that is built
+  /// with its names obfuscated has another name for nearly every type.
+  String get typeName => 'SSHException';
+
   @override
   String toString() {
-    final buffer = StringBuffer('$runtimeType: $message');
+    final buffer = StringBuffer('$typeName: $message');
     if (cause != null) {
       buffer.write(' (cause: $cause)');
     }
@@ -57,6 +62,9 @@ class SSHConnectionRefusedException extends SSHConnectionException {
     required super.port,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHConnectionRefusedException';
 }
 
 /// The connection attempt timed out.
@@ -74,6 +82,9 @@ class SSHConnectionTimedOutException extends SSHConnectionException {
     required this.timeout,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHConnectionTimedOutException';
 }
 
 /// The connection was reset by the remote host.
@@ -86,6 +97,9 @@ class SSHConnectionResetException extends SSHConnectionException {
     required super.port,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHConnectionResetException';
 }
 
 /// The network is unreachable.
@@ -98,6 +112,9 @@ class SSHNetworkUnreachableException extends SSHConnectionException {
     required super.port,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHNetworkUnreachableException';
 }
 
 /// DNS resolution failed for the target host.
@@ -110,6 +127,9 @@ class SSHDnsResolutionException extends SSHConnectionException {
     super.port = 22,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHDnsResolutionException';
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +157,9 @@ class SSHVersionMismatchException extends SSHHandshakeException {
     required this.serverVersion,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHVersionMismatchException';
 }
 
 /// No cipher algorithm acceptable to both sides.
@@ -154,6 +177,9 @@ class SSHNoMatchingCipherException extends SSHHandshakeException {
     required this.serverCiphers,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHNoMatchingCipherException';
 }
 
 /// No key-exchange algorithm acceptable to both sides.
@@ -171,6 +197,9 @@ class SSHNoMatchingKexException extends SSHHandshakeException {
     required this.serverKex,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHNoMatchingKexException';
 }
 
 /// No MAC algorithm acceptable to both sides.
@@ -188,6 +217,9 @@ class SSHNoMatchingMacException extends SSHHandshakeException {
     required this.serverMacs,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHNoMatchingMacException';
 }
 
 /// No host-key algorithm acceptable to both sides.
@@ -206,6 +238,9 @@ class SSHNoMatchingHostKeyException extends SSHHandshakeException {
     required this.serverHostKeys,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHNoMatchingHostKeyException';
 }
 
 // ---------------------------------------------------------------------------
@@ -251,6 +286,9 @@ class SSHHostKeyUnknownException extends SSHHostKeyException {
     required super.fingerprint,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHHostKeyUnknownException';
 }
 
 /// The host key differs from the one stored previously.
@@ -271,6 +309,9 @@ class SSHHostKeyChangedException extends SSHHostKeyException {
     required this.previousFingerprint,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHHostKeyChangedException';
 }
 
 /// The host key failed cryptographic verification.
@@ -286,6 +327,9 @@ class SSHHostKeyVerificationFailedException extends SSHHostKeyException {
     required super.fingerprint,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHHostKeyVerificationFailedException';
 }
 
 /// The host key has been explicitly revoked.
@@ -301,6 +345,9 @@ class SSHHostKeyRevokedException extends SSHHostKeyException {
     required super.fingerprint,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHHostKeyRevokedException';
 }
 
 // ---------------------------------------------------------------------------
@@ -329,6 +376,9 @@ class SSHAuthAllMethodsFailedException extends SSHAuthException {
     required this.attemptedMethods,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHAuthAllMethodsFailedException';
 }
 
 /// Password was rejected by the server.
@@ -337,6 +387,9 @@ class SSHPasswordIncorrectException extends SSHAuthException {
   String get message => 'Password authentication failed: incorrect password';
 
   SSHPasswordIncorrectException({super.cause});
+
+  @override
+  String get typeName => 'SSHPasswordIncorrectException';
 }
 
 /// The server reports the password has expired.
@@ -349,6 +402,9 @@ class SSHPasswordExpiredException extends SSHAuthException {
       'Password has expired${prompt != null ? ": $prompt" : ""}';
 
   SSHPasswordExpiredException({this.prompt, super.cause});
+
+  @override
+  String get typeName => 'SSHPasswordExpiredException';
 }
 
 /// Public key was rejected by the server.
@@ -362,6 +418,9 @@ class SSHKeyRejectedException extends SSHAuthException {
       '${keyType != null ? " (key type: $keyType)" : ""}';
 
   SSHKeyRejectedException({this.keyType, super.cause});
+
+  @override
+  String get typeName => 'SSHKeyRejectedException';
 }
 
 /// None of the available keys matched what the server will accept.
@@ -377,6 +436,9 @@ class SSHNoMatchingKeyException extends SSHAuthException {
     required this.availableKeyTypes,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHNoMatchingKeyException';
 }
 
 /// Failed to decrypt a private key (wrong passphrase, corrupt file, etc.).
@@ -390,6 +452,9 @@ class SSHKeyDecryptionException extends SSHAuthException {
       '${keyIdentifier != null ? " ($keyIdentifier)" : ""}';
 
   SSHKeyDecryptionException({this.keyIdentifier, super.cause});
+
+  @override
+  String get typeName => 'SSHKeyDecryptionException';
 }
 
 /// The username is not recognized by the server.
@@ -400,6 +465,9 @@ class SSHUserUnknownException extends SSHAuthException {
   String get message => 'User "$username" is not recognized by the server';
 
   SSHUserUnknownException({required this.username, super.cause});
+
+  @override
+  String get typeName => 'SSHUserUnknownException';
 }
 
 /// Keyboard-interactive authentication was cancelled by the user.
@@ -408,6 +476,9 @@ class SSHInteractiveCancelledException extends SSHAuthException {
   String get message => 'Keyboard-interactive authentication cancelled';
 
   SSHInteractiveCancelledException({super.cause});
+
+  @override
+  String get typeName => 'SSHInteractiveCancelledException';
 }
 
 /// Too many authentication attempts; the server will not accept more.
@@ -421,6 +492,9 @@ class SSHTooManyAttemptsException extends SSHAuthException {
       '${attempts != null ? " ($attempts)" : ""}';
 
   SSHTooManyAttemptsException({this.attempts, super.cause});
+
+  @override
+  String get typeName => 'SSHTooManyAttemptsException';
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +567,9 @@ class SSHDisconnectException extends SSHException {
 
   /// SSH_DISCONNECT_ILLEGAL_USER_NAME
   static const int illegalUserName = 15;
+
+  @override
+  String get typeName => 'SSHDisconnectException';
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +600,9 @@ class SSHChannelOpenException extends SSHChannelException {
     required this.description,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHChannelOpenException';
 }
 
 /// An operation was attempted on a closed channel.
@@ -535,6 +615,9 @@ class SSHChannelClosedException extends SSHChannelException {
       'Channel${channelId != null ? " $channelId" : ""} is closed';
 
   SSHChannelClosedException({this.channelId, super.cause});
+
+  @override
+  String get typeName => 'SSHChannelClosedException';
 }
 
 /// A channel request (e.g. "exec", "pty-req") was rejected by the server.
@@ -549,6 +632,9 @@ class SSHChannelRequestFailedException extends SSHChannelException {
     required this.requestType,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHChannelRequestFailedException';
 }
 
 // ---------------------------------------------------------------------------
@@ -569,6 +655,9 @@ class SSHProtocolViolationException extends SSHProtocolException {
   final String message;
 
   SSHProtocolViolationException(this.message, {super.cause});
+
+  @override
+  String get typeName => 'SSHProtocolViolationException';
 }
 
 /// A packet exceeded the maximum allowed size.
@@ -588,6 +677,9 @@ class SSHPacketTooLargeException extends SSHProtocolException {
     required this.maxSize,
     super.cause,
   });
+
+  @override
+  String get typeName => 'SSHPacketTooLargeException';
 }
 
 /// A packet was malformed or could not be parsed.
@@ -596,6 +688,9 @@ class SSHInvalidPacketException extends SSHProtocolException {
   final String message;
 
   SSHInvalidPacketException(this.message, {super.cause});
+
+  @override
+  String get typeName => 'SSHInvalidPacketException';
 }
 
 /// MAC verification failed on a received packet.
@@ -604,6 +699,9 @@ class SSHMacMismatchException extends SSHProtocolException {
   String get message => 'MAC verification failed on received packet';
 
   SSHMacMismatchException({super.cause});
+
+  @override
+  String get typeName => 'SSHMacMismatchException';
 }
 
 /// A packet could not be decrypted.
@@ -612,6 +710,9 @@ class SSHDecryptionException extends SSHProtocolException {
   String get message => 'Failed to decrypt packet';
 
   SSHDecryptionException({super.cause});
+
+  @override
+  String get typeName => 'SSHDecryptionException';
 }
 
 // ---------------------------------------------------------------------------
@@ -627,4 +728,7 @@ class SSHCancelledException extends SSHException {
   final Object? cause;
 
   SSHCancelledException([this.message = 'Operation cancelled', this.cause]);
+
+  @override
+  String get typeName => 'SSHCancelledException';
 }

@@ -48,7 +48,8 @@ void main() {
 
   test('an encrypted ChaCha packet uses the AEAD rule (length excluded)', () {
     final t = makeTransport();
-    setPrivate(t, '_serverCipherType', SSHCipherType.chacha20poly1305);
+    // In force for what the server sends, as it is once its keys are installed.
+    setPrivate(t, '_remoteCipherType', SSHCipherType.chacha20poly1305);
     setPrivate(t, '_remoteCipherKey', Uint8List(64));
     setPrivate(t, '_remoteIV', Uint8List(0));
     setPrivate(t, '_remoteChaCha', SSHCipherChaCha20Poly1305(key: Uint8List(64)));

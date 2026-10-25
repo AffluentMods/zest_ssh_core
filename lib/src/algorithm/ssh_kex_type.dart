@@ -88,6 +88,9 @@ class SSHKexType extends SSHAlgorithm {
   @override
   final String name;
 
+  @override
+  String get typeName => 'SSHKexType';
+
   final Digest Function() digestFactory;
 
   final bool isGroupExchange;

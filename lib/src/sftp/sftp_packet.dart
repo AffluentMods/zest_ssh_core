@@ -808,8 +808,11 @@ class SftpStatusPacket implements SftpResponsePacket {
     reader.readUint8(); // packet type
     final requestId = reader.readUint32();
     final code = reader.readUint32();
-    final message = reader.readUtf8();
-    final language = reader.readUtf8();
+    // Why, in the server's words (which may be in whatever encoding its
+    // system speaks): read as far as it can be. One byte that is no UTF-8
+    // ended the whole SFTP session, where one request had failed.
+    final message = reader.readUtf8(allowMalformed: true);
+    final language = reader.readUtf8(allowMalformed: true);
     return SftpStatusPacket(
       requestId: requestId,
       code: code,

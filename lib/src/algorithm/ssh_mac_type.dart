@@ -67,6 +67,9 @@ class SSHMacType extends SSHAlgorithm {
   @override
   final String name;
 
+  @override
+  String get typeName => 'SSHMacType';
+
   final int keySize;
 
   final Mac Function() macFactory;

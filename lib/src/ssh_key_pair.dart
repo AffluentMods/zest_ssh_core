@@ -27,6 +27,26 @@ abstract class SSHWrappedKeyPair {
   SSHKeyPair get innerKey;
 }
 
+/// A key pair that makes RSA signatures, which come in three kinds (RFC
+/// 8332): with SHA-512, with SHA-256, and the first kind, with SHA-1. A
+/// server takes some and refuses the others, so whoever signs in with such
+/// a key picks the kind for the server at hand
+/// ([SSHClient.serverSignatureAlgorithms]).
+///
+/// An RSA key pair is one. So is what wraps a key pair and signs with it
+/// (a certificate, a key that signs somewhere else): it says of itself
+/// what the key it wraps says.
+abstract class SSHRsaSignatureChoice implements SSHKeyPair {
+  /// The kinds of RSA signature this key can make
+  /// ([SSHRsaSignatureType]). Empty where it makes none: what wraps a key
+  /// of another kind.
+  List<String> get rsaSignatureTypes;
+
+  /// This key, making RSA signatures of the kind [type], which is one of
+  /// [rsaSignatureTypes]: its [SSHKeyPair.type] names that kind then.
+  SSHKeyPair signingAsRsa(String type);
+}
+
 abstract class SSHKeyPair {
   static List<SSHKeyPair> fromPem(String pemText, [String? passphrase]) {
     final pem = SSHPem.decode(pemText);
@@ -179,9 +199,9 @@ class OpenSSHKeyPairs {
       final passphraseBytes = Utf8Encoder().convert(passphrase);
       unencryptedKeys = _decryptPrivateKeyBlob(privateKeyBlob, passphraseBytes);
     } else {
-      if (passphrase != null) {
-        throw ArgumentError('Passphrase is not required for unencrypted keys');
-      }
+      // A passphrase given for a key that has none is not used, as OpenSSH
+      // does: one saved beside a key whose passphrase was since removed (on
+      // another device, by sync) must not make the key unreadable.
       unencryptedKeys = privateKeyBlob;
     }
 
@@ -273,7 +293,7 @@ class OpenSSHKeyPairs {
 
   @override
   String toString() {
-    return '$runtimeType{cipher: $cipherName, kdf: $kdfName, kdfOptions: $kdfOptions, keys.length: ${publicKeys.length}}';
+    return 'OpenSSHKeyPairs{cipher: $cipherName, kdf: $kdfName, kdfOptions: $kdfOptions, keys.length: ${publicKeys.length}}';
   }
 }
 
@@ -320,7 +340,7 @@ class OpenSSHBcryptKdfOptions implements OpenSSHKdfOptions {
 
   @override
   String toString() {
-    return '$runtimeType{salt: ${latin1.decode(salt)}, rounds: $rounds}';
+    return 'OpenSSHBcryptKdfOptions{salt: ${latin1.decode(salt)}, rounds: $rounds}';
   }
 }
 
@@ -355,12 +375,14 @@ mixin OpenSSHKeyPair implements SSHKeyPair {
   }
 }
 
-class OpenSSHRsaKeyPair with OpenSSHKeyPair {
+class OpenSSHRsaKeyPair with OpenSSHKeyPair implements SSHRsaSignatureChoice {
   @override
   final name = 'ssh-rsa';
 
+  /// The kind of signature this key makes ([SSHRsaSignatureType]): with
+  /// SHA-256, unless it was made to sign otherwise ([signingAsRsa]).
   @override
-  final type = SSHRsaSignatureType.sha256;
+  final String type;
 
   final BigInt n;
   final BigInt e;
@@ -379,8 +401,15 @@ class OpenSSHRsaKeyPair with OpenSSHKeyPair {
     this.iqmp,
     this.p,
     this.q,
-    this.comment,
-  );
+    this.comment, {
+    String type = SSHRsaSignatureType.sha256,
+  }) : type = SSHRsaSignatureType.known(type);
+
+  @override
+  List<String> get rsaSignatureTypes => SSHRsaSignatureType.all;
+
+  @override
+  OpenSSHRsaKeyPair signingAsRsa(String type) => OpenSSHRsaKeyPair(n, e, d, iqmp, p, q, comment, type: type);
 
   factory OpenSSHRsaKeyPair.readFrom(SSHMessageReader reader) {
     final n = reader.readMpint();
@@ -398,19 +427,11 @@ class OpenSSHRsaKeyPair with OpenSSHKeyPair {
     return SSHRsaPublicKey(e, n);
   }
 
+  /// Signs [data]; the signature is checked with the key's public half
+  /// before it is given out ([signRsaChecked]).
   @override
-  SSHRsaSignature sign(Uint8List data) {
-    final signer = RSASigner(SHA256Digest(), '0609608648016503040201');
-
-    signer.init(
-      true,
-      PrivateKeyParameter<RSAPrivateKey>(
-        RSAPrivateKey(n, d, p, q),
-      ),
-    );
-
-    return SSHRsaSignature(type, signer.generateSignature(data).bytes);
-  }
+  SSHRsaSignature sign(Uint8List data) =>
+      signRsaChecked(n: n, e: e, d: d, p: p, q: q, data: data, type: type);
 
   @override
   void writeTo(SSHMessageWriter writer) {
@@ -425,7 +446,7 @@ class OpenSSHRsaKeyPair with OpenSSHKeyPair {
 
   @override
   String toString() {
-    return '$runtimeType(comment: "$comment")';
+    return 'OpenSSHRsaKeyPair(comment: "$comment")';
   }
 }
 
@@ -471,7 +492,7 @@ class OpenSSHEd25519KeyPair with OpenSSHKeyPair {
 
   @override
   String toString() {
-    return '$runtimeType(comment: "$comment")';
+    return 'OpenSSHEd25519KeyPair(comment: "$comment")';
   }
 }
 
@@ -536,7 +557,7 @@ class OpenSSHEd448KeyPair with OpenSSHKeyPair {
 
   @override
   String toString() {
-    return '$runtimeType(comment: "$comment")';
+    return 'OpenSSHEd448KeyPair(comment: "$comment")';
   }
 }
 
@@ -616,7 +637,7 @@ class OpenSSHEcdsaKeyPair with OpenSSHKeyPair {
 
   @override
   String toString() {
-    return '$runtimeType(comment: "$comment")';
+    return 'OpenSSHEcdsaKeyPair(comment: "$comment")';
   }
 }
 
@@ -737,16 +758,18 @@ class RsaKeyPairDEKInfo {
 
   @override
   String toString() {
-    return '$runtimeType(algorithm: $algorithm, iv: ${hex.encode(iv)})';
+    return 'RsaKeyPairDEKInfo(algorithm: $algorithm, iv: ${hex.encode(iv)})';
   }
 }
 
-class RsaPrivateKey implements SSHKeyPair {
+class RsaPrivateKey implements SSHKeyPair, SSHRsaSignatureChoice {
   @override
   final name = 'ssh-rsa';
 
+  /// The kind of signature this key makes ([SSHRsaSignatureType]): with
+  /// SHA-256, unless it was made to sign otherwise ([signingAsRsa]).
   @override
-  final type = SSHRsaSignatureType.sha256;
+  final String type;
 
   final BigInt version;
   final BigInt n;
@@ -767,8 +790,16 @@ class RsaPrivateKey implements SSHKeyPair {
     this.q,
     this.exponent1,
     this.exponent2,
-    this.coefficient,
-  );
+    this.coefficient, {
+    String type = SSHRsaSignatureType.sha256,
+  }) : type = SSHRsaSignatureType.known(type);
+
+  @override
+  List<String> get rsaSignatureTypes => SSHRsaSignatureType.all;
+
+  @override
+  RsaPrivateKey signingAsRsa(String type) =>
+      RsaPrivateKey(version, n, e, d, p, q, exponent1, exponent2, coefficient, type: type);
 
   factory RsaPrivateKey.decode(Uint8List keyBlob) {
     final parser = ASN1Parser(keyBlob);
@@ -802,19 +833,11 @@ class RsaPrivateKey implements SSHKeyPair {
     return SSHRsaPublicKey(e, n);
   }
 
+  /// Signs [data]; the signature is checked with the key's public half
+  /// before it is given out ([signRsaChecked]).
   @override
-  SSHRsaSignature sign(Uint8List data) {
-    final signer = RSASigner(SHA256Digest(), '0609608648016503040201');
-
-    signer.init(
-      true,
-      PrivateKeyParameter<RSAPrivateKey>(
-        RSAPrivateKey(n, d, p, q),
-      ),
-    );
-
-    return SSHRsaSignature(type, signer.generateSignature(data).bytes);
-  }
+  SSHRsaSignature sign(Uint8List data) =>
+      signRsaChecked(n: n, e: e, d: d, p: p, q: q, data: data, type: type);
 
   /// Software RSA: signing is in-process with no IO, so async path
   /// just delegates to the sync one. Hardware-backed RSA goes through
@@ -840,7 +863,7 @@ class RsaPrivateKey implements SSHKeyPair {
 
   @override
   String toString() {
-    return '$runtimeType(version: $version)';
+    return 'RsaPrivateKey(version: $version)';
   }
 }
 
@@ -871,10 +894,8 @@ class EcKeyPair {
       );
     }
 
-    if (passphrase != null) {
-      throw ArgumentError('Passphrase is not required for unencrypted keys');
-    }
-
+    // A passphrase given for a key that has none is not used, as OpenSSH
+    // does (see OpenSSHKeyPairs.getPrivateKeys).
     try {
       return _decodeLegacyEcPrivateKey(keyBlob);
     } catch (e) {

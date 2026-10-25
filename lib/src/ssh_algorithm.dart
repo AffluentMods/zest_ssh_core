@@ -2,6 +2,7 @@ import 'package:zest_ssh_core/src/algorithm/ssh_cipher_type.dart';
 import 'package:zest_ssh_core/src/algorithm/ssh_hostkey_type.dart';
 import 'package:zest_ssh_core/src/algorithm/ssh_kex_type.dart';
 import 'package:zest_ssh_core/src/algorithm/ssh_mac_type.dart';
+import 'package:zest_ssh_core/src/hostkey/hostkey_rsa.dart' show SSHRsaSignatureType;
 
 abstract class SSHAlgorithm {
   /// The name of the algorithm.
@@ -9,9 +10,17 @@ abstract class SSHAlgorithm {
 
   const SSHAlgorithm();
 
+  /// What this kind of algorithm is called in code, spelled out by each
+  /// kind and not asked of the program (`runtimeType`): a program that is
+  /// built with its names obfuscated, as a released app most often is, has
+  /// another name for nearly every type, and the client's debug lines
+  /// print the algorithms a connection agreed on. A kind that spells no
+  /// name out is an "SSHAlgorithm".
+  String get typeName => 'SSHAlgorithm';
+
   @override
   String toString() {
-    return '$runtimeType($name)';
+    return '$typeName($name)';
   }
 }
 
@@ -42,6 +51,38 @@ class SSHAlgorithms {
 
   /// Algorithm used for the authentication.
   final List<SSHMacType> mac;
+
+  /// The kinds of signature an RSA key of the client's own may sign in
+  /// with ([SSHRsaSignatureType]), the one it would rather make first. A
+  /// server is asked about the first of them that it says it takes (RFC
+  /// 8332, 3.3).
+  ///
+  /// The first kind, with SHA-1 ("ssh-rsa"), is not among them unless it is
+  /// put there: SHA-1 no longer holds against a forged signature, and a
+  /// current server refuses it. An OpenSSH server older than 7.2 (2016)
+  /// knows no other.
+  final List<String> rsaSignatures;
+
+  /// The shortest RSA host key that is taken, by its modulus, in bits. A
+  /// server that shows a shorter one is not connected to
+  /// (`SSHHostkeyFault.tooShort`), before anything is computed with the
+  /// key and before anybody is asked about it: such a key can be worked
+  /// out by whoever has the means, who can then answer in the server's
+  /// place. 1024 where nothing is said, which is what OpenSSH takes. 0
+  /// takes a key of any length, for an old device that has no other,
+  /// where whoever connects to it has said so.
+  final int minRsaHostKeyBits;
+
+  /// The shortest Diffie-Hellman group that is asked for in a group
+  /// exchange, and taken, in bits (`SSHKexDH.requireGroupOfAnExchange`).
+  /// 2048 where nothing is said (`SSHKexDH.gexMin`), which is what OpenSSH
+  /// takes: a group of 1024 bits can be broken by whoever has the means,
+  /// and with it everything that was recorded of the sessions under it.
+  /// 1024 (`SSHKexDH.gexMinOldServers`) is for an old server whose SSH
+  /// server has no longer group and cannot be updated, where whoever
+  /// connects to it has said so. Nothing under 1024 is ever asked for or
+  /// taken, whatever is said here.
+  final int minDhGroupBits;
 
   const SSHAlgorithms({
     this.kex = const [
@@ -83,6 +124,15 @@ class SSHAlgorithms {
       // cipher first.
       SSHCipherType.aes256ctr,
       SSHCipherType.aes128ctr,
+      // AES-GCM, after everything that was offered before it. The first
+      // name of the client's list that the server has as well is the one
+      // agreed on (RFC 4253, 7.1), so a server that has any of the three
+      // above is connected to exactly as before, and these two are agreed
+      // on only with a server that has none of them: one set to GCM
+      // ciphers alone, as some hardened servers are, which could not be
+      // connected to at all while they were not offered.
+      SSHCipherType.aes256gcm,
+      SSHCipherType.aes128gcm,
       // CBC mode ciphers removed from defaults - CVE-2008-5161 plaintext
       // recovery when not paired with ETM MACs. Opt-in via custom
       // SSHAlgorithms if required for legacy servers.
@@ -101,5 +151,11 @@ class SSHAlgorithms {
       // hmac-md5 removed from defaults - MD5 is deprecated.
       // Opt-in via custom SSHAlgorithms if required for legacy servers.
     ],
+    this.rsaSignatures = const [
+      SSHRsaSignatureType.sha512,
+      SSHRsaSignatureType.sha256,
+    ],
+    this.minRsaHostKeyBits = 1024,
+    this.minDhGroupBits = 2048,
   });
 }

@@ -14,6 +14,9 @@ export 'src/socket/ssh_socket.dart';
 export 'src/algorithm/ssh_cipher_type.dart';
 export 'src/algorithm/ssh_hostkey_type.dart';
 export 'src/algorithm/ssh_kex_type.dart';
+// ML-KEM-768 (FIPS 203) by itself, for an application that builds its own
+// hybrid key agreement on it.
+export 'src/kex/mlkem768.dart' show MlKem768;
 export 'src/algorithm/ssh_mac_type.dart';
 
 export 'src/sftp/sftp_client.dart';

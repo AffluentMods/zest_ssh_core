@@ -32,6 +32,12 @@ class SSHSession {
   /// be available on the [stdout] and [stderr] streams at this time.
   Future<void> get done => _channel.done;
 
+  /// What ended the connection, where that is why this session ended: its
+  /// program was cut off, and how it would have ended is not known. Null
+  /// while the session runs, and for a session that was closed in order (by
+  /// the server once its program had ended, or from here).
+  Object? get endedBecause => _channel.endedBecause;
+
   SSHSession(this._channel) {
     _channel.setRequestHandler(_handleRequest);
 

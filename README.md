@@ -30,13 +30,16 @@ Two profiles. The default is what every connection proposes. The compatibility p
 | --- | --- | --- |
 | Key exchange | `mlkem768x25519-sha256`, `sntrup761x25519-sha512`, `sntrup761x25519-sha512@openssh.com`, `curve25519-sha256@libssh.org`, `curve25519-sha256`, `ecdh-sha2-nistp521`, `ecdh-sha2-nistp384`, `ecdh-sha2-nistp256`, `diffie-hellman-group-exchange-sha256`, `diffie-hellman-group14-sha256` | `diffie-hellman-group14-sha1`, `diffie-hellman-group-exchange-sha1`, `diffie-hellman-group1-sha1` |
 | Host keys | `ssh-ed25519`, `rsa-sha2-512`, `rsa-sha2-256`, `ecdsa-sha2-nistp521`, `ecdsa-sha2-nistp384`, `ecdsa-sha2-nistp256` | `ssh-rsa` (SHA-1) |
-| Ciphers | `chacha20-poly1305@openssh.com`, `aes256-ctr`, `aes128-ctr` | `aes256-cbc`, `aes192-cbc`, `aes128-cbc` |
+| Signatures an RSA key of yours signs in with | `rsa-sha2-512`, `rsa-sha2-256`: the first of them that the server says it takes, and `rsa-sha2-256` where it does not say | `ssh-rsa` (SHA-1) |
+| Ciphers | `chacha20-poly1305@openssh.com`, `aes256-ctr`, `aes128-ctr`, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com` | `aes256-cbc`, `aes192-cbc`, `aes128-cbc` |
 | MACs | `hmac-sha2-512-etm`, `hmac-sha2-256-etm`, `hmac-sha2-512`, `hmac-sha2-256`, `hmac-sha1`, `hmac-sha2-512-96`, `hmac-sha2-256-96` | `hmac-md5` |
 
 Two honest caveats:
 
 - `hmac-sha1` is still in the default MACs, listed last, for older-server reach. The SHA-1 key exchanges and the `ssh-rsa` SHA-1 host key are the ones that were pulled from the defaults, because a SHA-1 collision matters far more in key exchange and signatures than in a MAC. If you want SHA-1 gone entirely, drop `SSHMacType.hmacSha1` from your `SSHAlgorithms`.
-- A few algorithms exist in the source but are not in the default proposal (for example AES-GCM and `aes192-ctr`). The definitive lists are the `const` defaults in [`lib/src/ssh_algorithm.dart`](lib/src/ssh_algorithm.dart); that file is the source of truth, not this table.
+- AES-GCM is last among the default ciphers on purpose: the first cipher of the client's list that the server has is the one agreed on, so a server that has ChaCha20-Poly1305 or AES-CTR is connected to under one of those, and AES-GCM is agreed on only with a server that has nothing else (one set to GCM ciphers alone).
+- An RSA host key shorter than 1024 bits is refused, as OpenSSH refuses it. `SSHAlgorithms(minRsaHostKeyBits: 0)` takes one of any length, for an old device that has no other.
+- A few algorithms exist in the source but are not in the default proposal (for example `aes192-ctr`). The definitive lists are the `const` defaults in [`lib/src/ssh_algorithm.dart`](lib/src/ssh_algorithm.dart); that file is the source of truth, not this table.
 
 ### Terrapin
 
@@ -82,7 +85,7 @@ The record so far, last audited 2026-08-19 against upstream 3.3.0:
 
 Divergence from upstream's current defaults is deliberate: upstream now prefers AES-GCM in its default
 cipher list and has dropped the truncated 96-bit MACs, while this library leads with
-ChaCha20-Poly1305 and still offers the truncated MACs last. Both are defensible; the table in
+ChaCha20-Poly1305, offers AES-GCM after AES-CTR, and still offers the truncated MACs last. Both are defensible; the table in
 [Security posture](#security-posture) is the authority for what this library actually negotiates.
 
 `CHANGELOG.md` is this fork's history. Upstream's history up to the fork point is preserved in

@@ -40,10 +40,11 @@ class SftpFileWriter with DoneFuture {
   /// Creates a new [SftpFileWriter]. The upload process is started immediately
   /// after construction.
   SftpFileWriter(this.file, this.stream, this.offset, this.onProgress) {
-    _subscription =
-        stream.transform(MaxChunkSize(chunkSize)).listen(_handleLocalData);
-
-    _subscription.onDone(_handleLocalDone);
+    _subscription = stream.transform(MaxChunkSize(chunkSize)).listen(
+          _handleLocalData,
+          onError: _handleLocalError,
+          onDone: _handleLocalDone,
+        );
   }
 
   /// The subscription for [stream]. We use this to pause and resume the data
@@ -70,6 +71,9 @@ class SftpFileWriter with DoneFuture {
   ///
   /// - All data from [stream] has been written to [file]
   /// - Or the write operation has been aborted by calling [abort].
+  ///
+  /// It fails with the first write that the server refuses, and with what
+  /// [stream] itself fails with.
   @override
   Future<void> get done => _doneCompleter.future;
 
@@ -144,6 +148,18 @@ class SftpFileWriter with DoneFuture {
         _doneCompleter.completeError(e, st);
       }
       await _subscription.cancel();
+    }
+  }
+
+  /// [stream] failed: a file that could not be read to its end. The writing
+  /// ends with that, at once, whatever of it is still on its way; nothing
+  /// more comes of a stream that has failed (what cuts it into pieces ends
+  /// with it). (It was listened to for its data and its end alone: the
+  /// failure went to nobody, the stream ended behind it, and the writing was
+  /// over without a failure, with as much written as had come.)
+  void _handleLocalError(Object error, StackTrace stackTrace) {
+    if (!_doneCompleter.isCompleted) {
+      _doneCompleter.completeError(error, stackTrace);
     }
   }
 

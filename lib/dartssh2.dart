@@ -4,9 +4,11 @@ export 'src/ssh_client.dart';
 export 'src/ssh_errors.dart';
 export 'src/ssh_forward.dart';
 export 'src/ssh_key_pair.dart';
+export 'src/ssh_key_file.dart';
 // Only the signature class is generally useful to client code; the
 // host-key class collides with a same-named class inside the app.
 export 'src/ssh_hostkey.dart' show SSHSignature;
+export 'src/hostkey/hostkey_rsa.dart' show SSHRsaSignatureType;
 export 'src/ssh_pem.dart';
 export 'src/ssh_session.dart';
 export 'src/ssh_signal.dart';

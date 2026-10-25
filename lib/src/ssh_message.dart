@@ -83,10 +83,11 @@ class SSHMessageReader {
     return utf8.decode(readString(), allowMalformed: allowMalformed);
   }
 
+  /// A list of names (RFC 4251, 5). One with nothing in it has no names:
+  /// it was read as one name that is empty.
   List<String> readNameList() {
     final string = utf8.decode(readString());
-    final list = string.split(',');
-    return list;
+    return string.isEmpty ? const [] : string.split(',');
   }
 
   List<Uint8List> readStringList() {

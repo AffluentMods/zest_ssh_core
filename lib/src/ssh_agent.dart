@@ -7,12 +7,6 @@ import 'package:zest_ssh_core/src/ssh_hostkey.dart';
 import 'package:zest_ssh_core/src/ssh_key_pair.dart';
 import 'package:zest_ssh_core/src/ssh_message.dart';
 import 'package:zest_ssh_core/src/ssh_transport.dart';
-import 'package:pointycastle/api.dart' hide Signature;
-import 'package:pointycastle/asymmetric/api.dart' as asymmetric;
-import 'package:pointycastle/digests/sha1.dart';
-import 'package:pointycastle/digests/sha256.dart';
-import 'package:pointycastle/digests/sha512.dart';
-import 'package:pointycastle/signers/rsa_signer.dart';
 
 abstract class SSHAgentHandler {
   Future<Uint8List> handleRequest(Uint8List request);
@@ -89,9 +83,14 @@ class SSHKeyPairAgent implements SSHAgentHandler {
       SSHWrappedKeyPair(:final innerKey) => innerKey,
       _ => identity,
     };
-    if (signer is OpenSSHRsaKeyPair || signer is RsaPrivateKey) {
-      final signatureType = _rsaSignatureTypeForFlags(flags);
-      return _signRsa(signer, data, signatureType);
+    // An RSA key signs with the hash that was asked for, and its signature
+    // is checked with the key's public half before it is given out
+    // (signRsaChecked): one that is not the key's own would give the key
+    // away to the host the agent is forwarded to.
+    switch (signer) {
+      case OpenSSHRsaKeyPair(:final n, :final e, :final d, :final p, :final q) ||
+            RsaPrivateKey(:final n, :final e, :final d, :final p, :final q):
+        return signRsaChecked(n: n, e: e, d: d, p: p, q: q, data: data, type: _rsaSignatureTypeForFlags(flags));
     }
     // Hardware-token and agent-backed keys can only sign asynchronously
     // (their sign() throws), so forwarding them used to fail every time.
@@ -107,46 +106,6 @@ class SSHKeyPairAgent implements SSHAgentHandler {
       return SSHRsaSignatureType.sha256;
     }
     return SSHRsaSignatureType.sha1;
-  }
-
-  SSHRsaSignature _signRsa(
-    SSHKeyPair identity,
-    Uint8List data,
-    String signatureType,
-  ) {
-    final key = _rsaKeyFrom(identity);
-    if (key == null) {
-      return identity.sign(data) as SSHRsaSignature;
-    }
-
-    final signer = _rsaSignerFor(signatureType);
-    signer.init(true, PrivateKeyParameter<asymmetric.RSAPrivateKey>(key));
-    return SSHRsaSignature(signatureType, signer.generateSignature(data).bytes);
-  }
-
-  asymmetric.RSAPrivateKey? _rsaKeyFrom(SSHKeyPair identity) {
-    if (identity is OpenSSHRsaKeyPair) {
-      return asymmetric.RSAPrivateKey(
-          identity.n, identity.d, identity.p, identity.q);
-    }
-    if (identity is RsaPrivateKey) {
-      return asymmetric.RSAPrivateKey(
-          identity.n, identity.d, identity.p, identity.q);
-    }
-    return null;
-  }
-
-  RSASigner _rsaSignerFor(String signatureType) {
-    switch (signatureType) {
-      case SSHRsaSignatureType.sha1:
-        return RSASigner(SHA1Digest(), '06052b0e03021a');
-      case SSHRsaSignatureType.sha256:
-        return RSASigner(SHA256Digest(), '0609608648016503040201');
-      case SSHRsaSignatureType.sha512:
-        return RSASigner(SHA512Digest(), '0609608648016503040203');
-      default:
-        return RSASigner(SHA256Digest(), '0609608648016503040201');
-    }
   }
 
   SSHKeyPair? _findIdentity(Uint8List keyBlob) {
@@ -290,4 +249,60 @@ abstract class SSHAgentProtocol {
   static const int signResponse = 14;
   static const int rsaSha2_256 = 2;
   static const int rsaSha2_512 = 4;
+
+  /// SSH_AGENT_SUCCESS: what an agent answers a request that changes it.
+  static const int success = 6;
+
+  /// SSH2_AGENTC_ADD_IDENTITY: a key given to the agent to keep.
+  static const int addIdentity = 17;
+
+  /// SSH2_AGENTC_ADD_ID_CONSTRAINED: the same, with how it may be kept.
+  static const int addIdConstrained = 25;
+
+  /// SSH_AGENT_CONSTRAIN_LIFETIME: the key is kept for so many seconds.
+  static const int constrainLifetime = 1;
+
+  /// The request that gives [key] to an agent to keep (draft-miller-ssh-
+  /// agent, section 3.2): its type and private numbers as OpenSSH's agent
+  /// takes them, with [comment] (what `ssh-add -l` shows for it), and, where
+  /// [lifetime] is given, for that long only (whole seconds, at least one;
+  /// the agent forgets it after). Without the 4-byte length every message
+  /// to an agent goes with. Throws [UnsupportedError] for a key an OpenSSH
+  /// agent does not take (Ed448), or one held somewhere else (a hardware or
+  /// agent key, which has no numbers here).
+  static Uint8List addIdentityRequest(SSHKeyPair key, {String comment = '', Duration? lifetime}) {
+    final writer = SSHMessageWriter();
+    writer.writeUint8(lifetime == null ? addIdentity : addIdConstrained);
+    final inner = key is SSHWrappedKeyPair ? (key as SSHWrappedKeyPair).innerKey : key;
+    switch (inner) {
+      case OpenSSHRsaKeyPair(:final n, :final e, :final d, :final iqmp, :final p, :final q):
+        writer.writeUtf8('ssh-rsa');
+        for (final v in [n, e, d, iqmp, p, q]) {
+          writer.writeMpint(v);
+        }
+      case RsaPrivateKey(:final n, :final e, :final d, :final coefficient, :final p, :final q):
+        writer.writeUtf8('ssh-rsa');
+        for (final v in [n, e, d, coefficient, p, q]) {
+          writer.writeMpint(v);
+        }
+      case OpenSSHEd25519KeyPair(:final publicKey, :final privateKey):
+        writer.writeUtf8('ssh-ed25519');
+        writer.writeString(publicKey);
+        writer.writeString(privateKey);
+      case OpenSSHEcdsaKeyPair(:final curveId, :final q, :final d):
+        writer.writeUtf8('ecdsa-sha2-$curveId');
+        writer.writeUtf8(curveId);
+        writer.writeString(q);
+        writer.writeMpint(d);
+      default:
+        throw UnsupportedError('An agent cannot be given a key of this kind (${inner.type})');
+    }
+    writer.writeUtf8(comment.replaceAll(RegExp(r'[\r\n]+'), ' '));
+    if (lifetime != null) {
+      final seconds = lifetime.inSeconds < 1 ? 1 : lifetime.inSeconds;
+      writer.writeUint8(constrainLifetime);
+      writer.writeUint32(seconds);
+    }
+    return writer.takeBytes();
+  }
 }

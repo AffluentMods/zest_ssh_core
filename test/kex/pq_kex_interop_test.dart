@@ -7,19 +7,24 @@ import 'package:test/test.dart';
 import 'package:zest_ssh_core/dartssh2.dart';
 
 /// Interop of the hybrid post-quantum key exchanges against a REAL OpenSSH
-/// server (10.2 in WSL, started by scratchpad/setup_sshd.sh on
-/// 127.0.0.1:2299 with a user-owned host key and an ed25519 client key).
+/// server (10.2 in WSL, started by tool/test_sshd.sh on 127.0.0.1:2299 with
+/// a host key of its own and an ed25519 client key).
 ///
 /// Skipped when that server is not running, so the suite stays green on a
 /// machine without it. Override the defaults with ZESTSSH_TEST_SSHD_HOST /
-/// _PORT / _USER / _KEY.
+/// _PORT / _USER / _KEY (or _DIR, the folder the key lies in).
 void main() {
   final env = Platform.environment;
   final host = env['ZESTSSH_TEST_SSHD_HOST'] ?? '127.0.0.1';
   final port = int.tryParse(env['ZESTSSH_TEST_SSHD_PORT'] ?? '') ?? 2299;
-  final user = env['ZESTSSH_TEST_SSHD_USER'] ?? 'discr';
-  final keyPath = env['ZESTSSH_TEST_SSHD_KEY'] ??
-      r'\\wsl.localhost\Ubuntu\home\discr\zestssh-sshd-test\client_ed25519';
+  // Nobody's name in here: the user is this machine's, and the key lies in
+  // that user's home in WSL (or in $HOME where the tests run on Linux).
+  final user = env['ZESTSSH_TEST_SSHD_USER'] ?? env['USERNAME'] ?? env['USER'] ?? '';
+  final dir = env['ZESTSSH_TEST_SSHD_DIR'] ??
+      (Platform.isWindows
+          ? '//wsl.localhost/Ubuntu/home/$user/zestssh-sshd-test'
+          : '${env['HOME']}/zestssh-sshd-test');
+  final keyPath = env['ZESTSSH_TEST_SSHD_KEY'] ?? '$dir/client_ed25519';
 
   Future<bool> serverUp() async {
     try {
