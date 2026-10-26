@@ -23,7 +23,8 @@ jobs:
 
       - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
         with:
-          sdk: stable
+          # The Dart the app ships with (Flutter 3.38.9), so CI checks what users run.
+          sdk: 3.10.8
 
       - name: Install dependencies
         run: dart pub get

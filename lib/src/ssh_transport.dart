@@ -33,7 +33,6 @@ import 'package:zest_ssh_core/src/message/msg_kex_dh.dart';
 import 'package:zest_ssh_core/src/message/msg_kex_ecdh.dart';
 import 'package:zest_ssh_core/src/ssh_message.dart';
 import 'package:pointycastle/export.dart';
-import 'package:pointycastle/random/fortuna_random.dart';
 
 import 'package:zest_ssh_core/src/utils/secure_memory.dart';
 
