@@ -1,21 +1,27 @@
 # CI for the standalone public zest_ssh_core repo.
 # In the monorepo this file does nothing (Actions run from the repo root);
-# it is here so it ships with the package copy that becomes the public repo.
+# it is here so it ships with the package copy that becomes the public repo, whose working branch is
+# zest (it ran on main only, which the fork does not use).
 name: test
 
 on:
   push:
-    branches: [main]
+    branches: [zest]
   pull_request:
-    branches: [main]
+    branches: [zest]
+
+permissions:
+  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dart-lang/setup-dart@v1
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
         with:
           sdk: stable
 

@@ -2,6 +2,7 @@
 
 [![test](https://github.com/AffluentMods/zest_ssh_core/actions/workflows/test.yml/badge.svg)](https://github.com/AffluentMods/zest_ssh_core/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/AffluentMods/zest_ssh_core/badge)](https://scorecard.dev/viewer/?uri=github.com/AffluentMods/zest_ssh_core)
 
 A pure-Dart SSH and SFTP library, forked from [dartssh2](https://github.com/vicajilau/dartssh2) and hardened for use in [ZestSSH](https://zestssh.com).
 
