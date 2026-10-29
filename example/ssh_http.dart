@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:zest_ssh_core/dartssh2.dart';
 
 void main(List<String> args) async {

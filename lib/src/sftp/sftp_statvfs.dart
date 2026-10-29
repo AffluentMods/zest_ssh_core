@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:zest_ssh_core/src/sftp/sftp_packet_ext.dart';
 
 /// Information about the file system. Corresponds to the `statvfs` system call

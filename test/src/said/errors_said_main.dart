@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'dart:io';
 
 import 'errors_said.dart';

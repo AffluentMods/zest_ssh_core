@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'dart:math';
 
 import 'package:test/test.dart';

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /// Interface for all the exceptions thrown by the library.
 abstract class SSHError {}
 

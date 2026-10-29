@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /// Sealed hierarchy of events emitted during an SSH connection lifecycle.
 ///
 /// These events provide fine-grained observability into every phase of the

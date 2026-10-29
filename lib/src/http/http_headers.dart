@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:zest_ssh_core/src/http/http_content_type.dart';
 
 /// Headers for HTTP requests and responses.

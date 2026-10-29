@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 enum SSHAuthMethod {
   none,
   password,

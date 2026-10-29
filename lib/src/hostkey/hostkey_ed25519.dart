@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:convert/convert.dart';
 import 'package:zest_ssh_core/src/ssh_hostkey.dart';
 import 'package:zest_ssh_core/src/ssh_message.dart';

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'dart:typed_data';
 
 /// Overwrites every byte in [bytes] with zero.

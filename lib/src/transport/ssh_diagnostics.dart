@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /// Collects timing and negotiation data across the SSH connection lifecycle.
 ///
 /// Tracks timestamps for each connection phase (socket connect, version

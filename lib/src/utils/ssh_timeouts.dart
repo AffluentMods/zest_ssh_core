@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /// Per-phase timeout configuration for SSH connections.
 ///
 /// Each field controls how long the client will wait for a specific phase of

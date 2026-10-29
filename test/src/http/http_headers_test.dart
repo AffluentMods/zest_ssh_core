@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:test/test.dart';
 
 import '../mocks/mock_ssh_http_headers.dart';

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:zest_ssh_core/src/http/http_exception.dart';
 import 'package:test/test.dart';
 

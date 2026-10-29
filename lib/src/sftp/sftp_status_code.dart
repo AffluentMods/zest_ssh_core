@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 abstract class SftpStatusCode {
   /// Indicates successful completion of the operation.
   static const ok = 0;

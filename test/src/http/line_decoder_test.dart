@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'dart:convert';
 
 import 'package:zest_ssh_core/src/http/line_decoder.dart';

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /// Exception thrown when an SSH HTTP request fails.
 class SSHHttpException implements Exception {
   final String message;

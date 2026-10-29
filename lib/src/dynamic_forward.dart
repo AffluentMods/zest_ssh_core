@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:zest_ssh_core/src/dynamic_forward_stub.dart'
     if (dart.library.io) 'package:zest_ssh_core/src/dynamic_forward_io.dart' as impl;
 import 'package:zest_ssh_core/src/ssh_forward.dart';

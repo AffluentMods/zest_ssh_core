@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'dart:typed_data';
 
 /// Interface for a class that implements key exchange logic.

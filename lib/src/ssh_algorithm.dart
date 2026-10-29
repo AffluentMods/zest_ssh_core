@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:zest_ssh_core/src/algorithm/ssh_cipher_type.dart';
 import 'package:zest_ssh_core/src/algorithm/ssh_hostkey_type.dart';
 import 'package:zest_ssh_core/src/algorithm/ssh_kex_type.dart';

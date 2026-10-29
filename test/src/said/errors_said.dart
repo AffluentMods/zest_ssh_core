@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'dart:io' show SocketException;
 
 import 'package:zest_ssh_core/zest_ssh_core.dart';

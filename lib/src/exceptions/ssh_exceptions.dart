@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /// Complete SSH exception hierarchy for ZestSSH.
 ///
 /// Every exception carries a human-readable [message] and an optional [cause]

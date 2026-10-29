@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'dart:math' show Random;
 import 'dart:typed_data';
 

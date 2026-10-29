@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'dart:async';
 import 'dart:io' show FileSystemException;
 import 'dart:typed_data';

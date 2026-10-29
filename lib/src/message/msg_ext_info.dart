@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // ignore_for_file: camel_case_types
 
 import 'dart:convert';

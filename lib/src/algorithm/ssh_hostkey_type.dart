@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:zest_ssh_core/src/ssh_algorithm.dart';
 
 class SSHHostkeyType extends SSHAlgorithm {

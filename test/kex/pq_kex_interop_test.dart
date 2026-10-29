@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 @Tags(['integration'])
 library;
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'dart:typed_data';
 
 import 'package:pointycastle/digests/sha3.dart';

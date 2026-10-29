@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 class SftpFileOpenMode {
   /// Open the file for reading.
   static const read = SftpFileOpenMode._(1 << 0);

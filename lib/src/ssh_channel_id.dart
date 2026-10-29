@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 typedef SSHChannelId = int;
 
 class SSHChannelIdAllocator {

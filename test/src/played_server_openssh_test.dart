@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:test/test.dart';
 import 'package:zest_ssh_core/src/message/msg_request.dart';
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'dart:typed_data';
 
 /// A buffer that can queue chunks of data and consume parts or all of them as

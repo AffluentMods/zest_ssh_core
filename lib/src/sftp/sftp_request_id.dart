@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 class SftpRequestId {
   static const max = 0xFFFFFFFF;
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'dart:async';
 
 /// A cooperative cancellation token for SSH operations.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:zest_ssh_core/src/socket/ssh_socket.dart';
 
 Future<SSHSocket> connectNativeSocket(

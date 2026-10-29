@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:zest_ssh_core/src/ssh_forward.dart';
 
 typedef SSHDynamicDial = Future<SSHForwardChannel> Function(

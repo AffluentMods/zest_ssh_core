@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 /// Version of this library. Keep in step with the `version:` field in
 /// pubspec.yaml - it is the source of the client identification string sent
 /// during the SSH version exchange.

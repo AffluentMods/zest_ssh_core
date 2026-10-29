@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 import 'package:zest_ssh_core/src/sftp/sftp_errors.dart';
 import 'package:zest_ssh_core/src/sftp/sftp_packet.dart';
 import 'package:zest_ssh_core/src/sftp/sftp_status_code.dart';
