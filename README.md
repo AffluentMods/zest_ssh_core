@@ -53,7 +53,7 @@ SSH and SFTP client written in pure Dart, aiming to be feature-rich as well as e
     <td style="text-align: center;">
       <b><a href="https://github.com/lschaffer/tealkit">TealKit</a></b>
     </td>
-        <!-- ZestSSH -->
+    <!-- ZestSSH -->
     <td style="text-align: center;">
       <b><a href="https://zestssh.com">ZestSSH</a></b>
     </td>
