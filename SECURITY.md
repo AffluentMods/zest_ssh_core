@@ -2,6 +2,10 @@
 
 zest_ssh_core is maintained by one person, and security reports are read and answered personally.
 
+## Supported versions
+
+Fixes go into the latest release, on the default branch `zest`. Older versions get no fixes of their own: update to the latest. Release tags from v0.2.2 on are signed; see [docs/VERIFYING.md](docs/VERIFYING.md) to check one.
+
 ## Reporting
 
 Two ways, pick either:

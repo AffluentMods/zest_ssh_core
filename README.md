@@ -159,6 +159,13 @@ More in [`example/`](example/): interactive shells, command execution, SFTP, loc
 
 Found something? See [SECURITY.md](SECURITY.md). Reports go straight to a person, not a ticket queue.
 
+## Project
+
+- [ARCHITECTURE.md](ARCHITECTURE.md): how a connection runs and where the security checks live.
+- [docs/ASSURANCE.md](docs/ASSURANCE.md): the security assurance case, threats, trust boundaries and how weaknesses are countered.
+- [docs/VERIFYING.md](docs/VERIFYING.md): checking a signed release tag.
+- [ROADMAP.md](ROADMAP.md), [GOVERNANCE.md](GOVERNANCE.md), [CONTRIBUTING.md](CONTRIBUTING.md) and the [code of conduct](CODE_OF_CONDUCT.md).
+
 ## License
 
 MIT. See [LICENSE](LICENSE). The upstream dartssh2 copyright is preserved there alongside this fork's.
