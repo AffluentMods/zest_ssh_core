@@ -38,6 +38,25 @@ Every pull request is read and answered. Small, focused changes are easiest to r
 - **Licensed under MIT:** by contributing you agree that your contribution is licensed under the
   project's [MIT license](LICENSE).
 
+## How a change is reviewed
+
+Every change, the maintainer's own included, is reviewed against this list before it is merged:
+
+- **It does what it says,** and nothing else: the description, the code and the test agree.
+- **Defaults stay secure.** No default algorithm, floor or check is weakened; anything older goes
+  behind an opt-in, with a test that it is off by default.
+- **Untrusted input is bounded.** Anything read from the server has its length and values checked
+  before use, and a malformed value ends the connection with a clear error rather than being
+  guessed at.
+- **Secrets are handled with care.** Keys and passwords are not logged, not kept longer than
+  needed, and zeroed where the code already does so for their kind.
+- **Tests fail without the change** and pass with it; the checks below are clean.
+- **Compatibility is said.** A change in behaviour a user can see gets a line in `CHANGELOG.md`,
+  and a breaking API change is called out there.
+
+Reviews happen in the pull request, in the open. A change that does not meet the list is answered
+with what is missing.
+
 ## Running the checks
 
 ```bash
