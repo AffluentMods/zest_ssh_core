@@ -53,6 +53,10 @@ SSH and SFTP client written in pure Dart, aiming to be feature-rich as well as e
     <td style="text-align: center;">
       <b><a href="https://github.com/lschaffer/tealkit">TealKit</a></b>
     </td>
+        <!-- ZestSSH -->
+    <td style="text-align: center;">
+      <b><a href="https://zestssh.com">ZestSSH</a></b>
+    </td>
   </tr>
 
   <tr> 
@@ -81,6 +85,12 @@ SSH and SFTP client written in pure Dart, aiming to be feature-rich as well as e
     <td>
       <a href="https://github.com/lschaffer/tealkit">
         <img src="https://github.com/lschaffer/tealkit/blob/master/images/repo/desktop_playground_ssh_test.png" width="500px" alt="TealKit multiplatform agentic AI platform utilizing isolated SSH tools">
+      </a>
+    </td>
+    <!-- ZestSSH -->
+    <td>
+      <a href="https://zestssh.com">
+        <img src="https://zestssh.com/shots/desktop-hosts-1440.webp" width="300px" alt="ZestSSH, an SSH client for Windows, macOS, Linux, Android and iOS, with SFTP, port forwarding, server monitoring and end-to-end encrypted sync">
       </a>
     </td>
   </tr>
