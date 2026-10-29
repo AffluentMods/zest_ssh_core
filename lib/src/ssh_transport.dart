@@ -162,10 +162,43 @@ class SSHTransport {
     this.disableHostkeyVerification = false,
     this.rekeyAfterBytes = defaultRekeyAfterBytes,
     this.rekeyAfterPackets = defaultRekeyAfterPackets,
+    this.kexInitPatience = defaultKexInitPatience,
   })  : assert(rekeyAfterBytes > 0),
         assert(rekeyAfterPackets > 0) {
     _initSocket();
     _startHandshake();
+  }
+
+  /// How long a client waits, once the server's version has come, for the
+  /// server's proposal for the key exchange (SSH_MSG_KEXINIT) before it
+  /// ends the connection with [SSHHandshakeError.kexUnanswered]. A server
+  /// sends its proposal straight after its version, and nothing of it is
+  /// worked out first; a server that has sent neither within this has
+  /// stopped answering. Where it is said so, that is said in seconds, not
+  /// as a sign-in that ran out of time a while later.
+  final Duration kexInitPatience;
+
+  /// [kexInitPatience] where nothing is said.
+  static const defaultKexInitPatience = Duration(seconds: 10);
+
+  /// Ends the connection once [kexInitPatience] is over: from the server's
+  /// version until its first proposal (client only).
+  Timer? _kexInitWait;
+
+  void _stopKexInitWait() {
+    _kexInitWait?.cancel();
+    _kexInitWait = null;
+  }
+
+  void _kexInitNotCome() {
+    _kexInitWait = null;
+    if (isClosed) return;
+    printDebug?.call('SSHTransport: no KEXINIT from the server in ${kexInitPatience.inSeconds}s');
+    closeWithError(SSHHandshakeError(
+      'The server sent its version ($_remoteVersion) and then no key exchange '
+      'proposal in ${kexInitPatience.inSeconds} seconds',
+      kexUnanswered: true,
+    ));
   }
 
   /// How many bytes of what packets carry go out, or come in, under one set
@@ -739,6 +772,7 @@ class SSHTransport {
   void close() {
     printDebug?.call('SSHTransport.close');
     if (isClosed) return;
+    _stopKexInitWait();
     final said = _sayGoodbye();
     _socketSubscription?.cancel();
     _socketSubscription = null;
@@ -778,6 +812,7 @@ class SSHTransport {
   void closeWithError(SSHError error, [StackTrace? stackTrace]) {
     printDebug?.call('SSHTransport.closeWithError $error');
     if (isClosed) return;
+    _stopKexInitWait();
     _socketSubscription?.cancel();
     _socketSubscription = null;
     _doneCompleter.completeError(error, stackTrace ?? StackTrace.current);
@@ -903,6 +938,8 @@ class SSHTransport {
 
     if (isServer) {
       _sendKexInit();
+    } else {
+      _kexInitWait = Timer(kexInitPatience, _kexInitNotCome);
     }
 
     // There maybe more data in the buffer, so process it. Fire-and-forget for
@@ -2119,6 +2156,7 @@ class SSHTransport {
 
   void _handleMessageKexInit(Uint8List payload) {
     printDebug?.call('SSHTransport._handleMessageKexInit');
+    _stopKexInitWait();
 
     // One proposal to an exchange, and the next exchange only once this one
     // is over on both sides (see [_kexStep]).

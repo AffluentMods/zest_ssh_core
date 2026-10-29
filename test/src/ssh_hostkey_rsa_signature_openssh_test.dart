@@ -166,6 +166,10 @@ void main() {
               hostkey: [kind == 'rsa-sha2-256' ? SSHHostkeyType.rsaSha256 : SSHHostkeyType.rsaSha512],
               cipher: const [SSHCipherType.aes256ctr],
               mac: const [SSHMacType.hmacSha256],
+              // The key is 2041 bits on purpose (its signatures begin with
+              // a nought); what is held here is the signature, not the
+              // length, which 2048 bits where nothing is said would refuse.
+              minRsaHostKeyBits: 1024,
             ),
             onVerifyHostKey: (type, key) {
               asked++;

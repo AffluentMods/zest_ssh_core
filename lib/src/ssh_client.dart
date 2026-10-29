@@ -238,6 +238,12 @@ class SSHClient {
   /// ([SSHTransport.rekeyAfterPackets]).
   final int rekeyAfterPackets;
 
+  /// How long the client waits, once the server's version has come, for
+  /// the server's proposal for the key exchange: 10 seconds where nothing
+  /// is said ([SSHTransport.kexInitPatience]). A server that sends none in
+  /// that time ends the connection with [SSHHandshakeError.kexUnanswered].
+  final Duration kexInitPatience;
+
   /// Identification string advertised during the SSH version exchange (the part
   /// after `SSH-2.0-`). Defaults to [kDefaultClientIdent]
   /// (`'zest_ssh_core_<version>'`).
@@ -283,6 +289,7 @@ class SSHClient {
     this.disableHostkeyVerification = false,
     this.rekeyAfterBytes = SSHTransport.defaultRekeyAfterBytes,
     this.rekeyAfterPackets = SSHTransport.defaultRekeyAfterPackets,
+    this.kexInitPatience = SSHTransport.defaultKexInitPatience,
     String ident = kDefaultClientIdent,
   }) : ident = _validateIdent(ident) {
     _diagnostics = SSHConnectionDiagnostics();
@@ -307,6 +314,7 @@ class SSHClient {
       version: ident,
       rekeyAfterBytes: rekeyAfterBytes,
       rekeyAfterPackets: rekeyAfterPackets,
+      kexInitPatience: kexInitPatience,
     );
 
     _transport.done.then(

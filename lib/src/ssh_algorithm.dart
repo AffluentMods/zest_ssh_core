@@ -68,9 +68,10 @@ class SSHAlgorithms {
   /// (`SSHHostkeyFault.tooShort`), before anything is computed with the
   /// key and before anybody is asked about it: such a key can be worked
   /// out by whoever has the means, who can then answer in the server's
-  /// place. 1024 where nothing is said, which is what OpenSSH takes. 0
-  /// takes a key of any length, for an old device that has no other,
-  /// where whoever connects to it has said so.
+  /// place. 2048 where nothing is said: NIST's floor for RSA until 2030
+  /// (SP 800-131A), where OpenSSH still takes 1024. 1024 takes what
+  /// OpenSSH takes; 0 takes a key of any length, for an old device that
+  /// has no other, where whoever connects to it has said so.
   final int minRsaHostKeyBits;
 
   /// The shortest Diffie-Hellman group that is asked for in a group
@@ -155,7 +156,7 @@ class SSHAlgorithms {
       SSHRsaSignatureType.sha512,
       SSHRsaSignatureType.sha256,
     ],
-    this.minRsaHostKeyBits = 1024,
+    this.minRsaHostKeyBits = 2048,
     this.minDhGroupBits = 2048,
   });
 }

@@ -5,6 +5,27 @@ This is the changelog for `zest_ssh_core`. For the history of dartssh2 up to the
 
 ## Unreleased
 
+## 0.2.2 - 2026-10-29
+
+### Changed
+
+- **RSA host keys of at least 2048 bits by default** (`SSHAlgorithms.minRsaHostKeyBits`, was 1024 as in
+  OpenSSH): NIST's floor for RSA until 2030 (SP 800-131A), and the OpenSSF Best Practices
+  `crypto_keylength` criterion. A server with a shorter RSA host key is refused before anything is
+  computed with the key, with `SSHHostkeyError(fault: tooShort)` naming both lengths.
+  `minRsaHostKeyBits: 1024` takes what OpenSSH takes, and `0` any length, for an old device that
+  has no other.
+
+### Added
+
+- **A server that sends its version and no key exchange proposal is said so, in ten seconds.**
+  `SSHTransport.kexInitPatience` (and `SSHClient.kexInitPatience`), 10 seconds where nothing is
+  said, is how long a client waits from the server's version for its SSH_MSG_KEXINIT; then the
+  connection ends with `SSHHandshakeError(kexUnanswered: true)`, and not with a sign-in that ran out
+  of time later. The SSH inspection of a SonicWall firewall (DPI-SSH, which answers with
+  `SSH-2.0-libssh_0.9.0`) did this to a client's default offer (a user, 28 October 2026). What is
+  offered is unchanged.
+
 ### Changed
 
 - **AES-GCM is in the default proposal**, after the ciphers that were in it:

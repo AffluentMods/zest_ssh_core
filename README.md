@@ -72,7 +72,7 @@ Two honest caveats:
 
 - `hmac-sha1` is still in the default MACs, listed last, for older-server reach. The SHA-1 key exchanges and the `ssh-rsa` SHA-1 host key are the ones that were pulled from the defaults, because a SHA-1 collision matters far more in key exchange and signatures than in a MAC. If you want SHA-1 gone entirely, drop `SSHMacType.hmacSha1` from your `SSHAlgorithms`.
 - AES-GCM is last among the default ciphers on purpose: the first cipher of the client's list that the server has is the one agreed on, so a server that has ChaCha20-Poly1305 or AES-CTR is connected to under one of those, and AES-GCM is agreed on only with a server that has nothing else (one set to GCM ciphers alone).
-- An RSA host key shorter than 1024 bits is refused, as OpenSSH refuses it. `SSHAlgorithms(minRsaHostKeyBits: 0)` takes one of any length, for an old device that has no other.
+- An RSA host key shorter than 2048 bits is refused (NIST's floor for RSA until 2030; OpenSSH refuses under 1024). `SSHAlgorithms(minRsaHostKeyBits: 1024)` takes what OpenSSH takes, and `minRsaHostKeyBits: 0` one of any length, for an old device that has no other.
 - A few algorithms exist in the source but are not in the default proposal (for example `aes192-ctr`). The definitive lists are the `const` defaults in [`lib/src/ssh_algorithm.dart`](lib/src/ssh_algorithm.dart); that file is the source of truth, not this table.
 
 ### Terrapin

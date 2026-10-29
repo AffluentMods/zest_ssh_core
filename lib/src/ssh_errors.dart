@@ -67,11 +67,20 @@ class SSHHandshakeError with SSHMessageError implements SSHError {
   /// offers the same and is offered the same.
   bool get nothingInCommon => otherSideOffered != null;
 
+  /// Whether the server sent its version and then no proposal for the key
+  /// exchange in the time it is given ([SSHTransport.kexInitPatience]): it
+  /// went quiet before anything of the exchange had come. The SSH
+  /// inspection of a firewall that does not take what this side offers
+  /// does this (a SonicWall with DPI-SSH, 28 October 2026). Nothing of a
+  /// sign-in was sent.
+  final bool kexUnanswered;
+
   SSHHandshakeError(
     this.message, {
     this.strictOrderBroken = false,
     this.offered,
     this.otherSideOffered,
+    this.kexUnanswered = false,
   });
 
   @override

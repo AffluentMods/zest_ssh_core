@@ -32,8 +32,8 @@ import 'played_server.dart';
 /// the connection, saying what was wrong with the key, before the check and
 /// before anybody is asked.
 ///
-/// And no shorter than 1024 bits, which is OpenSSH's rule as well: a key of
-/// 512 bits can be worked out in hours, and whoever has done so answers in
+/// And no shorter than 2048 bits where nothing is said (NIST's floor until
+/// 2030; OpenSSH takes 1024): a key of 512 bits can be worked out in hours, and whoever has done so answers in
 /// the server's place with the server's own key. Such a key was checked as
 /// any other and put to whoever verifies host keys. It ends the connection
 /// now, said as too short with both lengths, unless whoever connects has
@@ -201,7 +201,7 @@ void main() {
       (2048, BigInt.from(3), 'the smallest exponent'),
       (2048, BigInt.from(35), 'an exponent of old keys'),
       (2048, (BigInt.one << 63) | BigInt.one, 'an exponent of 64 bits'),
-      (1024, BigInt.from(65537), 'the shortest key that is taken'),
+      (2048, BigInt.from(65537), 'the shortest key that is taken'),
     ]) {
       test('$what ($bits bits): not refused for its size', () async {
         final outcome = await shown(madeUp(odd(bits), e));
@@ -222,12 +222,12 @@ void main() {
           minRsaHostKeyBits: bits,
         );
 
-    test('where nothing is said of a shortest, it is 1024 bits', () {
-      expect(const SSHAlgorithms().minRsaHostKeyBits, 1024);
-      expect(offered.minRsaHostKeyBits, 1024);
+    test('where nothing is said of a shortest, it is 2048 bits', () {
+      expect(const SSHAlgorithms().minRsaHostKeyBits, 2048);
+      expect(offered.minRsaHostKeyBits, 2048);
     });
 
-    for (final bits in [1023, 768, 512, 17]) {
+    for (final bits in [2047, 1536, 1024, 768, 512, 17]) {
       test('$bits bits: refused for its length, with both lengths, before its signature is looked at, and nobody is '
           'asked', () async {
         final outcome = await shown(madeUp(odd(bits), BigInt.from(65537)));
@@ -236,9 +236,9 @@ void main() {
           isA<SSHHostkeyError>()
               .having((e) => e.fault, 'what was wrong', SSHHostkeyFault.tooShort)
               .having((e) => e.bits, 'how long it is', bits)
-              .having((e) => e.shortestTaken, 'the shortest taken', 1024)
+              .having((e) => e.shortestTaken, 'the shortest taken', 2048)
               .having((e) => e.message, 'what it says',
-                  'The RSA host key has a modulus of $bits bits, and none of less than 1024 is taken'),
+                  'The RSA host key has a modulus of $bits bits, and none of less than 2048 is taken'),
         );
         expect(outcome.asked, 0, reason: 'a key that is refused is not put to anybody');
         expect(outcome.ready, 0);
@@ -246,8 +246,8 @@ void main() {
       });
     }
 
-    test('a key of 1024 bits is refused for nothing of its length, and what it ends with names no lengths', () async {
-      final outcome = await shown(madeUp(odd(1024), BigInt.from(65537)));
+    test('a key of 2048 bits is refused for nothing of its length, and what it ends with names no lengths', () async {
+      final outcome = await shown(madeUp(odd(2048), BigInt.from(65537)));
       expect(
         outcome.endedWith,
         isA<SSHHostkeyError>()
