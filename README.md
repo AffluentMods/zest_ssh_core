@@ -1,14 +1,47 @@
-# zest_ssh_core
+<p align="center">
+  <a href="https://zestssh.com"><img src="media/zestssh/banner.jpg" width="640" alt="ZestSSH, the fresh SSH client, by Affluent Labs"></a>
+</p>
 
-[![test](https://github.com/AffluentMods/zest_ssh_core/actions/workflows/test.yml/badge.svg)](https://github.com/AffluentMods/zest_ssh_core/actions/workflows/test.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/AffluentMods/zest_ssh_core/badge)](https://scorecard.dev/viewer/?uri=github.com/AffluentMods/zest_ssh_core)
+<h1 align="center">Zest Core</h1>
+
+<p align="center"><b>zest_ssh_core</b>, the pure-Dart SSH and SFTP engine inside <a href="https://zestssh.com">ZestSSH</a></p>
+
+<p align="center">
+  <a href="https://github.com/AffluentMods/zest_ssh_core/actions/workflows/test.yml"><img src="https://github.com/AffluentMods/zest_ssh_core/actions/workflows/test.yml/badge.svg" alt="test"></a>
+  <a href="https://www.bestpractices.dev/projects/16027"><img src="https://www.bestpractices.dev/projects/16027/badge" alt="OpenSSF Best Practices"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/AffluentMods/zest_ssh_core"><img src="https://api.scorecard.dev/projects/github.com/AffluentMods/zest_ssh_core/badge" alt="OpenSSF Scorecard"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+</p>
 
 A pure-Dart SSH and SFTP library, forked from [dartssh2](https://github.com/vicajilau/dartssh2) and hardened for use in [ZestSSH](https://zestssh.com).
 
 The reason it is public: the code that talks to your servers should be code you can read. This is the exact SSH stack ZestSSH ships, nothing stripped out for the open-source version. If you want to know how the client authenticates, what it negotiates, or how it handles a host key, it is all here.
 
 MIT licensed, free to use, and staying that way.
+
+## Powering ZestSSH
+
+Every connection [ZestSSH](https://zestssh.com) makes, on Windows, macOS, Linux, Android and iOS, goes through this library: the terminal, SFTP, port forwarding, server monitoring and the keys you sign in with. (The hosts in these clips are made-up demo data.)
+
+<p align="center">
+  <a href="https://zestssh.com"><img src="media/zestssh/hero.webp" width="820" alt="ZestSSH on a computer: hosts, a terminal and the sidebar"></a>
+</p>
+
+<table>
+  <tr>
+    <td align="center" width="50%"><img src="media/zestssh/terminal.webp" alt="A ZestSSH terminal session"><br><b>Terminal</b></td>
+    <td align="center" width="50%"><img src="media/zestssh/sftp.webp" alt="ZestSSH's two-pane SFTP browser"><br><b>SFTP</b></td>
+  </tr>
+  <tr>
+    <td align="center"><img src="media/zestssh/monitor.webp" alt="ZestSSH's server monitor with live CPU, memory and disk"><br><b>Server monitor</b></td>
+    <td align="center"><img src="media/zestssh/keys.webp" alt="ZestSSH's keys page"><br><b>Keys</b></td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="media/zestssh/phone-hosts.webp" width="220" alt="ZestSSH on a phone: the hosts list"><br>
+  <sub>And on phones. <a href="https://zestssh.com">zestssh.com</a></sub>
+</p>
 
 ## Relationship to dartssh2
 
